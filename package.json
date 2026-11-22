@@ -1,0 +1,87 @@
+{
+  "name": "swr-redis",
+  "version": "1.0.0",
+  "description": "Stale-while-revalidate caching in Redis for Node.js, with typed caches, distributed fetch locking, and an optional in-memory LRU cache.",
+  "author": "cboar",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./pagination": {
+      "types": "./dist/pagination/index.d.ts",
+      "source": "./src/pagination/index.ts",
+      "import": "./dist/pagination/index.js",
+      "default": "./dist/pagination/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cboar/swr-redis.git"
+  },
+  "homepage": "https://cboar.github.io/swr-redis/",
+  "bugs": {
+    "url": "https://github.com/cboar/swr-redis/issues"
+  },
+  "keywords": [
+    "redis",
+    "ioredis",
+    "cache",
+    "caching",
+    "stale-while-revalidate",
+    "swr",
+    "lru",
+    "distributed-lock",
+    "stampede",
+    "typescript",
+    "nodejs"
+  ],
+  "scripts": {
+    "docs:dev": "npm --prefix docs run dev",
+    "docs:build": "npm --prefix docs run build",
+    "docs:preview": "npm --prefix docs run preview",
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "test": "node --test \"tests/*.test.ts\"",
+    "test:package": "node scripts/test-package.mjs",
+    "test:integration": "node --test \"tests/integration/*.test.ts\"",
+    "test:integration:docker": "bash scripts/test-integration-docker.sh",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write src tests scripts",
+    "format:check": "prettier --check src tests scripts",
+    "check": "npm run format:check && npm run typecheck && npm test && npm run test:package"
+  },
+  "peerDependencies": {
+    "bson": "^6.10.4 || ^7.0.0",
+    "ioredis": "^5.11.1 || ^6.0.0"
+  },
+  "devDependencies": {
+    "@tsconfig/node24": "^24.0.4",
+    "@types/node": "^24.13.2",
+    "bson": "^7.3.2",
+    "bson-v6": "npm:bson@6.10.4",
+    "ioredis": "^6.0.0",
+    "ioredis-v5": "npm:ioredis@5.11.1",
+    "prettier": "^3.10.1",
+    "typescript": "^6.0.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
