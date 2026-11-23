@@ -12,9 +12,11 @@ out the departure explicitly and explain why.
 Acquire, renew, release, and commit use an ownership token generated before the
 first Redis call. A retry with the same token can restore the lease after a lost
 reply, and cleanup can release that token even when acquisition was never
-acknowledged. A short initial lease allows quick recovery after a crash. Bounded,
-extend-only renewal gives slow fetches time to finish. `maxLockTtl` is a
-client-side scheduling budget, so delayed renewals can extend ownership past it.
+acknowledged. The initial Redis TTL is `lockTtl` so the lease expires quickly
+after a crash. Renewals give slow fetches time to finish. Each renewal requests
+at most `lockTtl`, capped by the time left in the client's `maxLockTtl` budget.
+Redis applies that TTL when it executes the command, so command latency can
+push expiry past the budget.
 
 One Lua script checks ownership, publishes the prepared entries, and releases the
 lease. Explicit writes and invalidations clear the affected keys' leases, so a
@@ -33,10 +35,9 @@ that repopulated value out of date for its entire fresh and stale lifetime.
 
 ## The writer sets freshness and expiry
 
-Each envelope starts with a 25-byte header containing a compression flag byte and
-three big-endian float64 timestamps for write time, freshness, and expiry. The
-header lets readers reject unusable entries before decoding the payload. Readers
-check again afterward because decoding can cross a deadline.
+The envelope header stores the writer's timestamps so readers can reject
+unusable entries before decoding the payload. Readers check again afterward
+because decoding can cross a deadline.
 
 Readers honor the writer's deadlines even when configured with different TTLs.
 Redis expiry is rounded up to whole seconds for key cleanup. The deadlines use

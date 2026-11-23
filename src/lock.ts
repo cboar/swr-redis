@@ -138,7 +138,8 @@ export class RedisLock {
           },
         )
       },
-      Math.max(1, Math.floor(lockTtlMs / 2)),
+      // At 40%, a promptly failed renewal can retry with about 20% of the lease left.
+      Math.max(1, Math.floor(lockTtlMs * 0.4)),
     )
     timer.unref()
 
