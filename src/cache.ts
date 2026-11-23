@@ -1,3 +1,4 @@
+import { addAbortListener } from 'node:events'
 import type { ClientInternals } from './client.ts'
 import {
   decodeEnvelopeValue,
@@ -390,6 +391,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
   private async fetchDirect(req: CacheRequest<Context>): Promise<T> {
     try {
+      req.signal?.throwIfAborted()
       const result = await this.fetch(req.context, {
         key: this.options.keyOf,
         ...(req.signal !== undefined ? { signal: req.signal } : {}),
@@ -429,6 +431,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       this.emit?.(errorEvent('lock_renewal_failure', req.key, { err }))
 
     try {
+      req.signal?.throwIfAborted()
       const result = await lock.hold(this.options, onRenewError, () =>
         this.fetch(req.context, {
           key: this.options.keyOf,
@@ -589,15 +592,17 @@ function validateBatch(batch: SwrWriteBatch<unknown>, primaryKey: string): void 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(signal.reason)
   return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(signal!.reason)
-    }
     const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
+      listener?.[Symbol.dispose]()
       resolve()
     }, ms)
-    signal?.addEventListener('abort', onAbort, { once: true })
+    // Unlike addEventListener, this still fires if another listener stops propagation.
+    const listener = signal
+      ? addAbortListener(signal, () => {
+          clearTimeout(timer)
+          reject(signal.reason)
+        })
+      : undefined
   })
 }
 

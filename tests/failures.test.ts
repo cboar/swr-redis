@@ -100,7 +100,7 @@ test(
   },
 )
 
-for (const failure of ['read', 'acquire'] as const) {
+for (const failure of ['read', 'acquire', 'poll'] as const) {
   for (const failureStrategy of ['availability', 'protect-source'] as const) {
     test(
       `failureStrategy ${failureStrategy}: cold ${failure} error`,
@@ -111,9 +111,13 @@ for (const failure of ['read', 'acquire'] as const) {
           throw new Error('Command timed out')
         }
         if (failure === 'read') redis.getBuffer = fail
-        else failAcquire(redis, new Error('Command timed out'))
+        else if (failure === 'acquire') failAcquire(redis, new Error('Command timed out'))
+        else {
+          await redis.set(toLockKey('redis-failure'), 'other-owner', 'PX', 5000)
+          redis.mgetBuffer = fail
+        }
         let fetches = 0
-        const cache = createSwrClient({ redis, failureStrategy }).cache({
+        const cache = createSwrClient({ redis, failureStrategy, pollIntervalMs: 1 }).cache({
           key: 'redis-failure',
           ttl: () => assert.fail('direct fallback bypasses TTL resolution'),
           fetch: async (_ctx, { cacheWrite }) => {
@@ -743,5 +747,48 @@ test(
       await released.promise
     }
     assert.equal(await redis.get(toLockKey('lost-grant')), null)
+  },
+)
+
+test(
+  'AbortSignal: an onEvent abort after lock acquisition skips the fetch and releases the lock',
+  { timeout: 2000 },
+  async (t) => {
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    const controller = new AbortController()
+    const reason = new Error('cancelled before fetch')
+    const cache = createSwrClient({
+      redis,
+      onEvent: (e) => e.type === 'miss' && e.action === 'fetch' && controller.abort(reason),
+    }).cache({ key: 'pre-fetch-abort', fetch: async () => assert.fail('fetch must not run') })
+    await assert.rejects(
+      cache.get(undefined, { signal: controller.signal }),
+      (err) => err === reason,
+    )
+    assert.equal(await redis.get(toLockKey('pre-fetch-abort')), null)
+  },
+)
+
+test(
+  'AbortSignal: an onEvent abort before the direct fallback fetch skips the fetch',
+  { timeout: 2000 },
+  async () => {
+    const redis = createFakeRedis()
+    redis.getBuffer = async () => {
+      throw new Error('Redis down')
+    }
+    const controller = new AbortController()
+    const reason = new Error('cancelled before direct fetch')
+    const cache = createSwrClient({
+      redis,
+      failureStrategy: 'availability',
+      onEvent: (e) =>
+        e.type === 'error' && e.reason === 'redis_error_fallback' && controller.abort(reason),
+    }).cache({ key: 'pre-direct-abort', fetch: async () => assert.fail('fetch must not run') })
+    await assert.rejects(
+      cache.get(undefined, { signal: controller.signal }),
+      (err) => err === reason,
+    )
   },
 )

@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { getEventListeners } from 'node:events'
 import assert from 'node:assert/strict'
 import { setImmediate } from 'node:timers/promises'
 import { pollDelayMs } from '../src/cache.ts'
@@ -422,3 +423,42 @@ for (const scenario of ['timeout', 'unlocked', 'redis_error'] as const) {
     },
   )
 }
+
+test(
+  'Poll sleep: abort cancels even when another listener stops propagation',
+  { timeout: 2000 },
+  async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    await holdLock(redis, lockKey('suppressed'), 60_000)
+    const waiting = Promise.withResolvers<void>()
+    const cache = createSwrClient({
+      redis,
+      pollIntervalMs: 100,
+      waitTimeout: 10,
+      onEvent: (event) => {
+        if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
+      },
+    }).cache({ key: 'suppressed', fetch: async () => assert.fail('aborted waiter must not fetch') })
+
+    const controller = new AbortController()
+    const { signal } = controller
+    // Registered first, so it runs before the poll sleep's listener.
+    signal.addEventListener('abort', (event) => event.stopImmediatePropagation())
+    const pending = cache.get(undefined, { signal })
+    await waiting.promise
+
+    // A normal wake disposes of its listener before the next sleep registers another.
+    await tick(t, redis, 200)
+    assert.equal(getEventListeners(signal, 'abort').length, 2)
+
+    const reason = new Error('stop waiting')
+    controller.abort(reason)
+    await assert.rejects(
+      Promise.race([pending, setImmediate()]),
+      (err) => err === reason,
+      'the waiter should reject on abort before the next poll timer fires',
+    )
+  },
+)

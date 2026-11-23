@@ -59,11 +59,11 @@ test('RedisLock.hold: renews normal lock while fetch runs and cleans up on compl
   const lock = new RedisLock(tracker.cmds, lockKey)
   const token = lock.token
 
-  await lock.acquire(220)
+  await lock.acquire(250)
 
   let releaseFetch!: () => void
   const run = lock.hold(
-    { lockTtlMs: 220, maxLockTtlMs: 1000 },
+    { lockTtlMs: 250, maxLockTtlMs: 1000 },
     () => assert.fail('no renewal error expected'),
     async () => {
       await new Promise<void>((resolve) => {
@@ -73,16 +73,16 @@ test('RedisLock.hold: renews normal lock while fetch runs and cleans up on compl
     },
   )
 
-  // Three 110ms intervals = 330ms (> initial 220ms lockTtlMs)
-  await tracker.advanceAndAwaitRenewal(t, 110)
+  // Three 100ms intervals = 300ms (> initial 250ms lockTtlMs)
+  await tracker.advanceAndAwaitRenewal(t, 100)
   assert.equal(tracker.calls, 1)
   assert.equal(await redis.get(lockKey), token)
 
-  await tracker.advanceAndAwaitRenewal(t, 110)
+  await tracker.advanceAndAwaitRenewal(t, 100)
   assert.equal(tracker.calls, 2)
   assert.equal(await redis.get(lockKey), token)
 
-  await tracker.advanceAndAwaitRenewal(t, 110)
+  await tracker.advanceAndAwaitRenewal(t, 100)
   assert.equal(tracker.calls, 3)
   assert.equal(await redis.get(lockKey), token)
 
@@ -90,7 +90,7 @@ test('RedisLock.hold: renews normal lock while fetch runs and cleans up on compl
   assert.equal(await run, 'done')
 
   // No further renewals occur after fetch completion
-  await tracker.advanceAndAwaitRenewal(t, 110)
+  await tracker.advanceAndAwaitRenewal(t, 100)
   assert.equal(tracker.calls, 3)
 
   const committed = await lock.commit([
@@ -112,7 +112,7 @@ test('RedisLock.hold: stops at maxLockTtl ceiling while fetch pending, expires l
 
   let releaseFetch!: () => void
   const run = lock.hold(
-    { lockTtlMs: 100, maxLockTtlMs: 250 },
+    { lockTtlMs: 100, maxLockTtlMs: 220 },
     () => assert.fail('no renewal error expected'),
     async () => {
       await new Promise<void>((resolve) => {
@@ -122,21 +122,22 @@ test('RedisLock.hold: stops at maxLockTtl ceiling while fetch pending, expires l
     },
   )
 
-  // Renewals at 50ms (+100=150), 100ms (+100=200), 150ms (+100=250 -> hits exact ceiling and stops)
+  // Renewals at 40ms (+100=140), 80ms (+100=180), 120ms (+100=220 -> hits exact ceiling and stops)
   for (let i = 1; i <= 3; i++) {
-    await tracker.advanceAndAwaitRenewal(t, 50)
+    await tracker.advanceAndAwaitRenewal(t, 40)
     assert.equal(tracker.calls, i)
     assert.equal(await redis.get(lockKey), token)
   }
   assert.deepEqual(tracker.ttls, [100, 100, 100])
 
-  // At 200ms: interval already cleared after hitting exact ceiling at 150ms -> no 4th renewal
-  await tracker.advanceAndAwaitRenewal(t, 50)
+  // At 160ms and 200ms: interval already cleared after hitting exact ceiling at 120ms
+  await tracker.advanceAndAwaitRenewal(t, 40)
+  await tracker.advanceAndAwaitRenewal(t, 40)
   assert.equal(tracker.calls, 3)
   assert.equal(await redis.get(lockKey), token)
 
-  // At 250ms: last renewed lock (150 + 100 = 250) expires while fetch is still pending
-  await tracker.advanceAndAwaitRenewal(t, 50)
+  // At 220ms: last renewed lock (120 + 100 = 220) expires while fetch is still pending
+  await tracker.advanceAndAwaitRenewal(t, 20)
   assert.equal(tracker.calls, 3)
   assert.equal(await redis.get(lockKey), null)
 
@@ -151,7 +152,7 @@ test('RedisLock.hold: stops at maxLockTtl ceiling while fetch pending, expires l
   assert.equal(await redis.getBuffer('data:ceiling'), null)
 })
 
-test('RedisLock.hold: clamps final renewal under timer drift (100/250, tick at 155ms)', async (t) => {
+test('RedisLock.hold: clamps final renewal under timer drift (100/220, tick at 125ms)', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] })
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
@@ -162,24 +163,25 @@ test('RedisLock.hold: clamps final renewal under timer drift (100/250, tick at 1
   await lock.acquire(100)
   let releaseFetch!: () => void
   const run = lock.hold(
-    { lockTtlMs: 100, maxLockTtlMs: 250 },
+    { lockTtlMs: 100, maxLockTtlMs: 220 },
     () => assert.fail('no renewal error expected'),
     () => new Promise<string>((resolve) => (releaseFetch = () => resolve('done'))),
   )
 
-  await tracker.advanceAndAwaitRenewal(t, 50)
-  await tracker.advanceAndAwaitRenewal(t, 50)
-  // Clock drifts +5ms ahead of interval timer so the 3rd tick fires at elapsed=155ms.
-  await tracker.advanceAndAwaitRenewal(t, 50, 55)
+  await tracker.advanceAndAwaitRenewal(t, 40)
+  await tracker.advanceAndAwaitRenewal(t, 40)
+  // Clock drifts +5ms ahead of interval timer so the 3rd tick fires at elapsed=125ms.
+  await tracker.advanceAndAwaitRenewal(t, 40, 45)
   assert.deepEqual(tracker.ttls, [100, 100, 95])
   assert.equal(await redis.get(lockKey), lock.token)
 
-  await tracker.advanceAndAwaitRenewal(t, 50)
+  await tracker.advanceAndAwaitRenewal(t, 40)
+  await tracker.advanceAndAwaitRenewal(t, 40)
   assert.equal(tracker.calls, 3)
   assert.equal(await redis.get(lockKey), lock.token)
 
-  // At elapsed=250ms (205 + 45): lock expires at ceiling.
-  await tracker.advanceAndAwaitRenewal(t, 45)
+  // At elapsed=220ms (205 + 15): lock expires at ceiling.
+  await tracker.advanceAndAwaitRenewal(t, 15)
   assert.equal(tracker.calls, 3)
   assert.equal(await redis.get(lockKey), null)
 
@@ -203,7 +205,7 @@ test('RedisLock.hold: stops without sending when a tick lands at or past exhaust
   )
 
   // Clock jumps to exact ceiling (remainingMs === 0) before the first tick fires.
-  await tracker.advanceAndAwaitRenewal(t, 50, 250)
+  await tracker.advanceAndAwaitRenewal(t, 40, 250)
   assert.deepEqual(tracker.ttls, [])
 
   releaseFetch()
@@ -219,7 +221,7 @@ test('RedisLock.hold: failed clamped renewal retries on next tick with smaller T
   const lockKey = 'lock:retry-clamped'
   const lock = new RedisLock(cmds, lockKey)
 
-  await lock.acquire(101)
+  await lock.acquire(100)
   const ttls: number[] = []
   const reported: unknown[] = []
   cmds.swrExtendLock = async (key, token, ttlMs) => {
@@ -230,17 +232,19 @@ test('RedisLock.hold: failed clamped renewal retries on next tick with smaller T
 
   let releaseFetch!: () => void
   const run = lock.hold(
-    { lockTtlMs: 101, maxLockTtlMs: 180 },
+    { lockTtlMs: 100, maxLockTtlMs: 170 },
     (err) => reported.push((err as Error).message),
     () => new Promise<string>((resolve) => (releaseFetch = () => resolve('done'))),
   )
 
-  for (let i = 0; i < 4; i++) {
-    redis.advanceTime(50)
-    t.mock.timers.tick(50)
+  for (let elapsed = 40; elapsed <= 200; elapsed += 40) {
+    redis.advanceTime(40)
+    t.mock.timers.tick(40)
     await new Promise<void>((resolve) => setImmediate(resolve))
+    // The lease would expire at 140ms without the successful retry.
+    if (elapsed === 160) assert.equal(await redis.get(lockKey), lock.token)
   }
-  assert.deepEqual(ttls, [101, 80, 30])
+  assert.deepEqual(ttls, [100, 90, 50])
   assert.deepEqual(reported, ['transient clamped failure'])
   assert.equal(await redis.get(lockKey), null)
 
@@ -269,15 +273,15 @@ test('RedisLock.hold: cleans up interval on fetch rejection', async (t) => {
     },
   )
 
-  await tracker.advanceAndAwaitRenewal(t, 50)
+  await tracker.advanceAndAwaitRenewal(t, 40)
   assert.equal(tracker.calls, 1)
 
   rejectFetch(new Error('upstream failed'))
   await assert.rejects(run, { message: 'upstream failed' })
 
   // Timer must be cleared so subsequent ticks do not call swrExtendLock
-  await tracker.advanceAndAwaitRenewal(t, 50)
-  await tracker.advanceAndAwaitRenewal(t, 50)
+  await tracker.advanceAndAwaitRenewal(t, 40)
+  await tracker.advanceAndAwaitRenewal(t, 40)
   assert.equal(tracker.calls, 1)
 })
 
@@ -304,8 +308,8 @@ test('RedisLock.hold: reports renewal errors while active, keeps renewing, and s
     () => new Promise<string>((resolve) => (releaseFetch = () => resolve('done'))),
   )
   const tick = async () => {
-    redis.advanceTime(50)
-    t.mock.timers.tick(50)
+    redis.advanceTime(40)
+    t.mock.timers.tick(40)
     await new Promise<void>((resolve) => setImmediate(resolve))
   }
 
