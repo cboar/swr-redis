@@ -104,6 +104,22 @@ const user = await userCache.get('u_123', {
 })
 ```
 
+Use `getWithMeta()` when you need per-call metadata alongside the value. It
+returns `value`, `source`, and an optional `timing` object.
+
+`source` tells you whether the value came from the in-memory cache, Redis, or
+this call's own fetch. This includes stale values served from Redis.
+
+`timing` carries the `cachedAtMs`, `freshUntilMs`, and `expiresAtMs` timestamps
+recorded by the writer. Fetch results omit `timing` if the call skips the cache
+write or the write fails to commit.
+
+```ts
+const { value, source, timing } = await userCache.getWithMeta('u_123')
+res.setHeader('X-Cache', source)
+if (timing) res.setHeader('Age', Math.max(0, Math.floor((Date.now() - timing.cachedAtMs) / 1000)))
+```
+
 ## Update cached values
 
 Always update your source of truth before updating or invalidating the cache:

@@ -169,8 +169,36 @@ export interface SwrCacheOptions<T = unknown, Context = void> extends SwrCacheDe
   SwrFetchResult<T>
 > {}
 
+/** Writer-set deadlines of a cached value, as wall-clock milliseconds. */
+export interface SwrEntryTiming {
+  readonly cachedAtMs: number
+  readonly freshUntilMs: number
+  readonly expiresAtMs: number
+}
+
+/**
+ * Value and metadata returned by `getWithMeta()`. `source` identifies where the returned value
+ * came from:
+ * - `'memory'`: in-memory LRU cache hit.
+ * - `'redis'`: read from Redis by this call, including values written by another caller and stale
+ *   values returned while a background refresh runs or after a refresh fails.
+ * - `'fetch'`: returned from this call's own `fetch`.
+ */
+export type SwrGetResult<T> =
+  | { readonly value: T; readonly source: 'memory' | 'redis'; readonly timing: SwrEntryTiming }
+  | {
+      readonly value: T
+      readonly source: 'fetch'
+      /**
+       * Absent unless this call committed the value to Redis (`SwrNoCache`, fallback fetches, lost
+       * leases, and failed commits).
+       */
+      readonly timing?: SwrEntryTiming
+    }
+
 export interface SwrCache<T = unknown, Context = void> {
   get: (context: Context, options?: SwrGetOptions) => Promise<T>
+  getWithMeta: (context: Context, options?: SwrGetOptions) => Promise<SwrGetResult<T>>
   /**
    * Writes `value` to Redis, then updates the client's memory cache (stores when enabled for this
    * cache, or evicts when `memory: false`). Evicts from memory on Redis failure; `'availability'`

@@ -53,6 +53,8 @@ TypeScript infers the argument to `get()` from `key` and the return type from `f
 const user = await userCache.get('u_123') // User | null
 ```
 
+Call `getWithMeta()` when you need the value's source and cache timing alongside the result.
+
 Update the source of truth first, then update the cached value.
 
 ```ts

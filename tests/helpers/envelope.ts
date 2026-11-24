@@ -3,29 +3,27 @@ import {
   decodeEnvelopeValue,
   encodeEnvelope as encode,
   readEnvelopeHeader,
-  type CacheEnvelope,
 } from '../../src/codec.ts'
 import { resolveCompression } from '../../src/options.ts'
-import type { SwrCodec, SwrCompressionOption } from '../../src/types.ts'
+import type { SwrCodec, SwrCompressionOption, SwrEntryTiming } from '../../src/types.ts'
+
+type EnvelopeFields<T> = SwrEntryTiming & { value: T }
 
 export function encodeEnvelope<T>(
-  envelope: CacheEnvelope<T>,
+  envelope: EnvelopeFields<T>,
   codec: SwrCodec<T> = DEFAULT_CODEC as SwrCodec<T>,
   compression?: SwrCompressionOption,
 ): Buffer {
-  return encode(envelope, codec, resolveCompression(compression))
+  return encode(envelope.value, envelope, codec, resolveCompression(compression))
 }
 
 export function decodeEnvelope<T>(
   buffer: Uint8Array,
   codec: SwrCodec<T> = DEFAULT_CODEC as SwrCodec<T>,
-): CacheEnvelope<T> {
+): EnvelopeFields<T> {
   const header = readEnvelopeHeader(buffer)
-  const { cachedAtMs, freshUntilMs, expiresAtMs } = header
   return {
     value: decodeEnvelopeValue(buffer, header, codec),
-    cachedAtMs,
-    freshUntilMs,
-    expiresAtMs,
+    ...header.timing,
   }
 }

@@ -1,11 +1,6 @@
 import { addAbortListener } from 'node:events'
 import type { ClientInternals } from './client.ts'
-import {
-  decodeEnvelopeValue,
-  encodeEnvelope,
-  readEnvelopeHeader,
-  type CacheEnvelope,
-} from './codec.ts'
+import { decodeEnvelopeValue, encodeEnvelope, readEnvelopeHeader, type Envelope } from './codec.ts'
 import { isFatalError, SwrTimeoutError, SwrValidationError } from './errors.ts'
 import { bindCacheEmitter, errorEvent, reportRedisError, type Emit } from './events.ts'
 import { requireNonEmpty } from './keys.ts'
@@ -23,9 +18,11 @@ import type {
   SwrCache,
   SwrCacheOptions,
   SwrCodec,
+  SwrEntryTiming,
   SwrEvent,
   SwrFetchResult,
   SwrGetOptions,
+  SwrGetResult,
 } from './types.ts'
 import { SwrNoCache, SwrWriteBatch } from './wrappers.ts'
 
@@ -46,7 +43,7 @@ type LockAttempt =
   | { status: 'busy' }
   | { status: 'redis_error'; err: unknown }
 
-type PreparedWrite = RedisWriteEntry & MemoryWrite
+type PreparedWrite = RedisWriteEntry & MemoryWrite & { readonly timing: SwrEntryTiming }
 
 type PreparedFetch<T> =
   | { kind: 'no-cache'; value: T }
@@ -57,16 +54,13 @@ type PreparedFetch<T> =
       durationMs: number
     }
 
-/** A stale value to fall back to while still within its expiry window, boxed because `undefined` is a valid cached value. */
-type StaleFallback<T> = { value: T; expiresAtMs: number }
-
 type PollSnapshot<T> =
-  | { status: 'hit'; value: T }
+  | { status: 'hit'; envelope: Envelope<T> }
   | { status: 'locked' | 'unlocked' }
   | { status: 'redis_error'; err: unknown }
 
 type WaitResult<T> =
-  | { outcome: 'resolved' | 'stale_fallback'; value: T }
+  | { outcome: 'resolved' | 'stale_fallback'; envelope: Envelope<T> }
   | { outcome: 'timeout'; elapsedMs: number }
   | { outcome: 'error'; err: unknown }
   | { outcome: 'lock_stolen'; lock: RedisLock }
@@ -98,6 +92,10 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 
   async get(context: Context, options?: SwrGetOptions): Promise<T> {
+    return (await this.getWithMeta(context, options)).value
+  }
+
+  async getWithMeta(context: Context, options?: SwrGetOptions): Promise<SwrGetResult<T>> {
     options?.signal?.throwIfAborted()
     const key = this.options.keyOf(context)
     const useMemory = this.options.memoryEnabled && options?.memory !== false
@@ -112,7 +110,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
           stale: false,
           startedRevalidation: false,
         })
-        return hit.value
+        return cached(hit, 'memory')
       }
     }
 
@@ -142,14 +140,9 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
     const { entry } = read
     if (!entry) return await this.onColdMiss(req)
-    if (!entry.fresh) {
-      return await this.onStaleHit(req, {
-        value: entry.envelope.value,
-        expiresAtMs: entry.envelope.expiresAtMs,
-      })
-    }
+    if (!entry.fresh) return await this.onStaleHit(req, entry.envelope)
     this.emit?.({ type: 'hit', key, source: 'redis', stale: false, startedRevalidation: false })
-    return entry.envelope.value
+    return cached(entry.envelope, 'redis')
   }
 
   async set(context: Context, value: T): Promise<void> {
@@ -225,12 +218,15 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return acquired ? { status: 'acquired', lock } : { status: 'busy' }
   }
 
-  private async onStaleHit(req: CacheRequest<Context>, stale: StaleFallback<T>): Promise<T> {
+  private async onStaleHit(
+    req: CacheRequest<Context>,
+    stale: Envelope<T>,
+  ): Promise<SwrGetResult<T>> {
     const { mode } = this.options
     const { key } = req
     const attempt = await this.tryLock(req)
     const acquired = attempt.status === 'acquired'
-    const usable = isStaleUsable(stale)
+    const usable = isUsable(stale)
     this.emit?.({ type: 'hit', key, source: 'redis', stale: true, startedRevalidation: acquired })
 
     if (attempt.status === 'redis_error') {
@@ -240,7 +236,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     }
     if (!acquired) {
       if (!usable) return await this.poll(req)
-      return mode === 'wait-on-stale' ? await this.poll(req, stale) : stale.value
+      return mode === 'wait-on-stale' ? await this.poll(req, stale) : cached(stale, 'redis')
     }
 
     if (mode === 'swr' && usable) {
@@ -248,13 +244,13 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       const background = { ...req, signal: undefined }
       const refresh = this.refresh(background, attempt.lock, 'stale_revalidation', stale)
       this.client.track(refresh, req.waitUntil)
-      return stale.value
+      return cached(stale, 'redis')
     }
 
     return await this.refresh(req, attempt.lock, 'stale_revalidation', usable ? stale : undefined)
   }
 
-  private async onColdMiss(req: CacheRequest<Context>): Promise<T> {
+  private async onColdMiss(req: CacheRequest<Context>): Promise<SwrGetResult<T>> {
     const attempt = await this.tryLock(req)
     if (attempt.status === 'redis_error') return await this.onRedisError(req, attempt.err)
 
@@ -267,7 +263,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return await this.refresh(req, attempt.lock, 'cold_miss')
   }
 
-  private async poll(req: CacheRequest<Context>, stale?: StaleFallback<T>): Promise<T> {
+  private async poll(req: CacheRequest<Context>, stale?: Envelope<T>): Promise<SwrGetResult<T>> {
     const progress: PollProgress = { attempts: 0, startedAt: Date.now() }
     let result: WaitResult<T>
     try {
@@ -279,8 +275,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       }
       this.emitPoll(req, 'error', progress)
       // waitForEntry only throws non-abort errors from decodeAndPopulate.
-      if (stale && isStaleUsable(stale))
-        return this.serveStaleAfterError(req.key, stale, 'read', err)
+      if (isUsable(stale)) return this.serveStaleAfterError(req.key, stale, 'read', err)
       throw err
     }
     this.emitPoll(
@@ -293,9 +288,9 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     switch (result.outcome) {
       case 'resolved':
       case 'stale_fallback':
-        return result.value
+        return cached(result.envelope, 'redis')
       case 'timeout': {
-        if (stale && isStaleUsable(stale)) return stale.value
+        if (isUsable(stale)) return cached(stale, 'redis')
         if (this.options.failureStrategy !== 'protect-source') return await this.fetchDirect(req)
         const durationMs = result.elapsedMs
         const err = new SwrTimeoutError(req.key, durationMs)
@@ -303,7 +298,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         throw err
       }
       case 'error':
-        return stale && isStaleUsable(stale)
+        return isUsable(stale)
           ? this.serveStaleAfterError(req.key, stale, 'redis', result.err)
           : await this.onRedisError(req, result.err)
       case 'lock_stolen':
@@ -313,7 +308,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
   private async waitForEntry(
     req: CacheRequest<Context>,
-    stale: StaleFallback<T> | undefined,
+    stale: Envelope<T> | undefined,
     progress: PollProgress,
   ): Promise<WaitResult<T>> {
     const { waitTimeoutMs, pollIntervalMs } = this.options
@@ -328,12 +323,12 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       signal?.throwIfAborted()
 
       progress.attempts++
-      const accept: Accept = stale && isStaleUsable(stale) ? 'fresh' : 'usable'
+      const accept: Accept = isUsable(stale) ? 'fresh' : 'usable'
       const snapshot = await this.pollSnapshot(req, accept)
       if (snapshot.status === 'redis_error') return { outcome: 'error', err: snapshot.err }
-      if (snapshot.status === 'hit') return { outcome: 'resolved', value: snapshot.value }
+      if (snapshot.status === 'hit') return { outcome: 'resolved', envelope: snapshot.envelope }
       if (snapshot.status === 'locked') continue
-      if (stale && isStaleUsable(stale)) return { outcome: 'stale_fallback', value: stale.value }
+      if (isUsable(stale)) return { outcome: 'stale_fallback', envelope: stale }
 
       const attempt = await this.tryLock(req)
       if (attempt.status === 'redis_error') return { outcome: 'error', err: attempt.err }
@@ -354,7 +349,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       req.signal?.throwIfAborted()
 
       const entry = this.decodeAndPopulate(data ?? null, accept, guard)
-      if (entry) return { status: 'hit', value: entry.envelope.value }
+      if (entry) return { status: 'hit', envelope: entry.envelope }
       return { status: lock ? 'locked' : 'unlocked' }
     })
   }
@@ -374,19 +369,19 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     })
   }
 
-  private async onRedisError(req: CacheRequest<Context>, err: unknown): Promise<T> {
+  private async onRedisError(req: CacheRequest<Context>, err: unknown): Promise<SwrGetResult<T>> {
     this.reportRedisError(req.key, err)
     return await this.fetchDirect(req)
   }
 
   private serveStaleAfterError(
     key: string,
-    stale: StaleFallback<T>,
+    stale: Envelope<T>,
     stage: StaleFallbackStage,
     err: unknown,
-  ): T {
+  ): SwrGetResult<T> {
     this.emit?.(errorEvent('stale_fallback', key, { stage, err }))
-    return stale.value
+    return cached(stale, 'redis')
   }
 
   private reportRedisError(key: string, err: unknown): void {
@@ -394,7 +389,11 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 
   // Returns the stale fallback when allowed; otherwise rethrows.
-  private onFetchError(req: CacheRequest<Context>, err: unknown, stale?: StaleFallback<T>): T {
+  private onFetchError(
+    req: CacheRequest<Context>,
+    err: unknown,
+    stale?: Envelope<T>,
+  ): SwrGetResult<T> {
     if (req.signal?.aborted) throw err
     if (!stale) {
       this.emit?.(errorEvent('fetch_cold_failure', req.key, { err }))
@@ -403,16 +402,16 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     if (isFatalError(err, this.options.isFatal)) {
       this.emit?.(errorEvent('fatal', req.key, { err }))
       if (this.options.mode !== 'swr') throw err
-      return stale.value
+      return cached(stale, 'redis')
     }
-    if (this.options.mode !== 'swr' && !isStaleUsable(stale)) {
+    if (this.options.mode !== 'swr' && !isUsable(stale)) {
       this.emit?.(errorEvent('fetch_cold_failure', req.key, { err }))
       throw err
     }
     return this.serveStaleAfterError(req.key, stale, 'refresh', err)
   }
 
-  private async fetchDirect(req: CacheRequest<Context>): Promise<T> {
+  private async fetchDirect(req: CacheRequest<Context>): Promise<SwrGetResult<T>> {
     try {
       req.signal?.throwIfAborted()
       const result = await this.fetch(req.context, {
@@ -422,9 +421,9 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       })
       if (result instanceof SwrWriteBatch) {
         validateBatch(result, req.key)
-        return result.primary
+        return fetched(result.primary)
       }
-      return result instanceof SwrNoCache ? result.value : result
+      return fetched(result instanceof SwrNoCache ? result.value : result)
     } catch (err) {
       return this.onFetchError(req, err)
     }
@@ -434,8 +433,8 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     req: CacheRequest<Context>,
     lock: RedisLock,
     trigger: RefreshTrigger,
-    stale?: StaleFallback<T>,
-  ): Promise<T> {
+    stale?: Envelope<T>,
+  ): Promise<SwrGetResult<T>> {
     let prepared: PreparedFetch<T>
     try {
       prepared = await this.fetchLocked(req, lock)
@@ -513,8 +512,8 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     lock: RedisLock,
     prepared: PreparedFetch<T>,
     trigger: RefreshTrigger,
-  ): Promise<T> {
-    if (prepared.kind === 'no-cache') return prepared.value
+  ): Promise<SwrGetResult<T>> {
+    if (prepared.kind === 'no-cache') return fetched(prepared.value)
 
     const { memory } = this.client
     const { value, entries, durationMs } = prepared
@@ -531,7 +530,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       const keys: SwrNonEmptyKeys = [primary.key, ...secondary.map((entry) => entry.key)]
       this.emit?.(errorEvent('redis_error_fallback', req.key, { keys, err }))
       await this.safeRelease(req, lock)
-      return value
+      return fetched(value)
     }
 
     // Evict even when the lock was lost: if a reply was lost, ioredis resends the command after
@@ -542,7 +541,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         ? { type: 'refresh', trigger, key: req.key, durationMs }
         : errorEvent('lock_lost', req.key, { durationMs }),
     )
-    return value
+    return fetched(value, committed ? entries[0].timing : undefined)
   }
 
   private async safeRelease(req: CacheRequest<Context>, lock: RedisLock): Promise<void> {
@@ -562,17 +561,17 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   ) {
     const { staleMultiplier, compression } = this.options
     const ttlSeconds = toRedisTtlSeconds(ttl, staleMultiplier)
-    const envelope: CacheEnvelope<V> = {
-      value,
+    // Freeze once to protect deadlines. Cheap enough to be worth enforcing at runtime.
+    const timing: SwrEntryTiming = Object.freeze({
       cachedAtMs,
       freshUntilMs: cachedAtMs + ttl * 1000,
       expiresAtMs: cachedAtMs + ttl * staleMultiplier * 1000,
-    }
-    const buffer = encodeEnvelope(envelope, encoder, compression)
-    if (!useMemory) return { buffer, ttlSeconds }
-    if (!this.client.memory.clones) return { buffer, ttlSeconds, envelope }
+    })
+    const buffer = encodeEnvelope(value, timing, encoder, compression)
+    if (!useMemory) return { timing, buffer, ttlSeconds }
     // Clone before writing to Redis so uncloneable values fail before any Redis write.
-    return { buffer, ttlSeconds, envelope: { ...envelope, value: structuredClone(value) } }
+    const memoryValue = this.client.memory.clones ? structuredClone(value) : value
+    return { timing, buffer, ttlSeconds, envelope: { value: memoryValue, timing } }
   }
 
   private resolvePrimaryTtl(context: Context, key: string, value: T): number {
@@ -582,24 +581,28 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 }
 
-function isStaleUsable(stale: StaleFallback<unknown>): boolean {
-  return Date.now() < stale.expiresAtMs
+function isUsable<T>(entry: Envelope<T> | undefined): entry is Envelope<T> {
+  return entry !== undefined && Date.now() < entry.timing.expiresAtMs
+}
+
+function cached<T>(entry: Envelope<T>, source: 'memory' | 'redis'): SwrGetResult<T> {
+  return { value: entry.value, source, timing: entry.timing }
+}
+
+function fetched<T>(value: T, timing?: SwrEntryTiming): SwrGetResult<T> {
+  return timing ? { value, source: 'fetch', timing } : { value, source: 'fetch' }
 }
 
 function decodeEntry<T>(buf: Buffer | null, accept: Accept, codec: SwrCodec<T>) {
   if (!buf) return undefined
   const header = readEnvelopeHeader(buf)
+  const { timing } = header
   const now = Date.now()
-  const deadlineMs = accept === 'fresh' ? header.freshUntilMs : header.expiresAtMs
+  const deadlineMs = accept === 'fresh' ? timing.freshUntilMs : timing.expiresAtMs
   if (now >= deadlineMs) return undefined
 
   const value = decodeEnvelopeValue(buf, header, codec)
-  const { cachedAtMs, freshUntilMs, expiresAtMs } = header
-  return {
-    fresh: now < freshUntilMs,
-    envelope: { value, cachedAtMs, freshUntilMs, expiresAtMs },
-    now,
-  }
+  return { envelope: { value, timing }, fresh: now < timing.freshUntilMs, now }
 }
 
 function validateBatch(batch: SwrWriteBatch<unknown>, primaryKey: string): void {

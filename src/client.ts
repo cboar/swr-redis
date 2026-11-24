@@ -32,6 +32,7 @@ export function createSwrClient(options: SwrClientOptions): SwrClient {
       const impl = new SwrCacheImpl<T, Context>(internals, cacheOptions)
       return {
         get: impl.get.bind(impl),
+        getWithMeta: impl.getWithMeta.bind(impl),
         set: impl.set.bind(impl),
         invalidate: impl.invalidate.bind(impl),
         key: impl.key.bind(impl),
