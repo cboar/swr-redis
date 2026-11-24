@@ -51,8 +51,8 @@ All library errors extend `SwrCacheError` (which extends `Error`):
 | Class | Thrown when | Useful fields |
 | --- | --- | --- |
 | `SwrValidationError` | An option, key, `ttl` callback result, `SwrWriteBatch`, or pagination input is invalid. | |
-| `SwrRedisError` | Under `'protect-source'`, Redis fails before a fetch or during `set`, `invalidate`, or `invalidateKeys`. | `key`, `keys`, `cause` |
-| `SwrTimeoutError` | Under `'protect-source'`, waiting on a cold miss exceeds `waitTimeout`. | `key`, `elapsedMs` |
+| `SwrRedisError` | Under `'protect-source'`, Redis fails before a fetch with no stale value to serve, or during `set`, `invalidate`, or `invalidateKeys`. | `key`, `keys`, `cause` |
+| `SwrTimeoutError` | Under `'protect-source'`, waiting exceeds `waitTimeout` with no stale value to serve. | `key`, `elapsedMs` |
 
 ## Mark fatal fetch errors
 
@@ -110,18 +110,18 @@ logical key) and optional `cache` (the cache `name`, omitted for
 | `'miss'` | `action` (`'fetch' \| 'wait'`) | A key is missing or expired: `'fetch'` when this caller took the lock, `'wait'` when another caller holds it. |
 | `'poll'` | `outcome`, `attempts`, `durationMs` | A caller finishes waiting for another caller's fetch. `outcome` is `'resolved'`, `'lock_stolen'`, `'stale_fallback'`, `'timeout'`, `'cancelled'`, or `'error'`. |
 | `'refresh'` | `trigger` (`'cold_miss' \| 'stale_revalidation' \| 'lock_stolen'`), `durationMs` | A fetch result is committed to Redis. Omitted for `SwrNoCache`, fallback fetches, lost locks, and failed commits. |
-| `'error'` | `reason`, `severity` (`'warn' \| 'error'`), plus reason-specific fields | A Redis failure, fetch failure, wait timeout, or lock issue occurs (see below). |
+| `'error'` | `reason`, `severity` (`'warn' \| 'error'`), plus reason-specific fields | A Redis, read, or fetch failure, wait timeout, or lock issue occurs (see below). |
 
 ### Error event reasons
 
 | `reason` | `severity` | Extra fields | Meaning |
 | --- | --- | --- | --- |
-| `redis_error` | `'error'` | `keys`, `err` | Pre-fetch or mutation Redis error under `'protect-source'`. |
-| `redis_error_fallback` | `'warn'` | `keys`, `err` | Pre-fetch or mutation Redis error under `'availability'`, or a post-fetch commit error under either strategy. |
-| `fetch_cold_failure` | `'error'` | `err` | `fetch` failed on a miss or fallback fetch (excluding caller abort). |
+| `redis_error` | `'error'` | `keys`, `err` | Redis error under `'protect-source'` that rejects the request. |
+| `redis_error_fallback` | `'warn'` | `keys`, `err` | Redis error handled without rejecting: direct fetch or mutation failure under `'availability'`, or a post-fetch commit error under either strategy. |
+| `fetch_cold_failure` | `'error'` | `err` | `fetch` failed without a stale value to fall back to (excluding caller abort). |
 | `fatal` | `'error'` | `err` | `fetch` threw a fatal error during a stale refresh. |
-| `fetch_stale_fallback` | `'warn'` | `err` | `fetch` threw a non-fatal error during a stale refresh and the stale value was used. |
-| `timeout` | `'error'` | `err`, `durationMs` | Cold-miss wait timed out under `'protect-source'`. |
+| `stale_fallback` | `'warn'` | `stage`, `err` | A stale value was returned after a Redis error (`'redis'`), cache read error (`'read'`), or non-fatal fetch error (`'refresh'`). |
+| `timeout` | `'error'` | `err`, `durationMs` | Wait timed out under `'protect-source'` with no stale value to serve. |
 | `lock_lost` | `'warn'` | `durationMs` | Fetch finished after its lock expired or was cleared; write skipped. |
 | `lock_renewal_failure` | `'warn'` | `err` | Background lock renewal failed while `fetch` ran (retried while budget remains). |
 | `lock_release_failure` | `'warn'` | `err` | Releasing the lock failed after an error, cancellation, `SwrNoCache`, or failed write. |

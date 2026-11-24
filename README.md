@@ -74,7 +74,7 @@ For background refreshes in serverless runtimes, pass `waitUntil`. On shutdown, 
 
 ## Choose what happens when Redis fails
 
-When Redis fails before a fetch, `'availability'` (default) serves stale data when available or fetches directly from the source without caching. Set `failureStrategy: 'protect-source'` to reject the request and limit load on the source. [Failure strategies](https://cboar.github.io/swr-redis/consistency/#failure-strategies)
+When Redis fails before a fetch, both strategies return an unexpired stale value if one is available. Otherwise, `'availability'` (default) fetches directly from the source without caching, while `failureStrategy: 'protect-source'` rejects the request to limit load on the source. [Failure strategies](https://cboar.github.io/swr-redis/consistency/#failure-strategies)
 
 ## Before you deploy
 

@@ -1,6 +1,6 @@
 {
   "name": "swr-redis",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Stale-while-revalidate caching in Redis for Node.js, with typed caches, distributed fetch locking, and an optional in-memory LRU cache.",
   "author": "cboar",
   "license": "MIT",

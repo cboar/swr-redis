@@ -11,9 +11,10 @@ import type { SwrNoCache, SwrWriteBatch } from './wrappers.ts'
 export type SwrMode = 'swr' | 'swr-serverless' | 'wait-on-stale'
 
 /**
- * Behavior when Redis fails or a cold-miss wait exceeds `waitTimeout`:
- * - `'availability'`: Serve stale if available or fetch from source without caching; report failed `set`/`invalidate` calls via `onEvent`.
- * - `'protect-source'`: Throw `SwrRedisError` on pre-fetch/mutation Redis errors and `SwrTimeoutError` on cold-miss wait timeout.
+ * Behavior when Redis fails or a wait exceeds `waitTimeout` and no stale value can be served.
+ * Both strategies return an unexpired stale value when one is available.
+ * - `'availability'`: Fetch from source without caching; report failed `set`/`invalidate` calls via `onEvent`.
+ * - `'protect-source'`: Reject on pre-fetch Redis errors, failed explicit writes or invalidations, and wait timeouts.
  */
 export type SwrFailureStrategy = 'availability' | 'protect-source'
 
@@ -66,7 +67,7 @@ export interface SwrSharedOptions {
   staleMultiplier?: number
   /** Stale revalidation mode. Default: `'swr'`. */
   mode?: SwrMode
-  /** Behavior on Redis errors or cold-miss wait timeouts. Default: `'availability'`. */
+  /** Behavior on Redis errors or wait timeouts when no stale value is available. Default: `'availability'`. */
   failureStrategy?: SwrFailureStrategy
   /** zlib compression settings for Redis payloads. Default: `{ level: 1, minBytes: 256 }`. */
   compression?: SwrCompressionOption
@@ -205,7 +206,13 @@ export type SwrErrorEvent = { type: 'error'; cache?: string; key: string } & (
   | { reason: 'redis_error_fallback'; severity: 'warn'; keys: SwrNonEmptyKeys; err: unknown }
   | { reason: 'fetch_cold_failure' | 'fatal'; severity: 'error'; err: unknown }
   | {
-      reason: 'fetch_stale_fallback' | 'lock_release_failure' | 'lock_renewal_failure'
+      reason: 'stale_fallback'
+      severity: 'warn'
+      stage: 'redis' | 'read' | 'refresh'
+      err: unknown
+    }
+  | {
+      reason: 'lock_release_failure' | 'lock_renewal_failure'
       severity: 'warn'
       err: unknown
     }

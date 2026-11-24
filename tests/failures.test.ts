@@ -27,12 +27,14 @@ for (const releaseFails of [false, true]) {
       const redis = createFakeRedis(1000)
       useRedisClock(t, redis)
       const failure = new Error('Database down')
+      const releaseFailure = new Error('Redis connection lost during release')
+      const events: SwrEvent[] = []
       if (releaseFails) {
         registerLockCommands(redis).swrReleaseLock = async () => {
-          throw new Error('Redis connection lost during release')
+          throw releaseFailure
         }
       }
-      const cache = createSwrClient({ redis }).cache({
+      const cache = createSwrClient({ redis, onEvent: (event) => events.push(event) }).cache({
         key: 'cold-fail',
         fetch: async () => {
           throw failure
@@ -40,12 +42,35 @@ for (const releaseFails of [false, true]) {
       })
       await assert.rejects(cache.get(), (error) => error === failure)
       if (!releaseFails) assert.equal(await redis.get(toLockKey('cold-fail')), null)
+      assert.deepEqual(
+        events.filter((event) => event.type === 'error'),
+        [
+          ...(releaseFails
+            ? [
+                {
+                  type: 'error',
+                  key: 'cold-fail',
+                  reason: 'lock_release_failure',
+                  severity: 'warn',
+                  err: releaseFailure,
+                },
+              ]
+            : []),
+          {
+            type: 'error',
+            key: 'cold-fail',
+            reason: 'fetch_cold_failure',
+            severity: 'error',
+            err: failure,
+          },
+        ],
+      )
     },
   )
 }
 
 test(
-  'Stale fallback returns the snapshot read at get() start, even past expiry and when lock release fails',
+  'Stale fallback returns an unexpired snapshot even when lock release fails',
   { timeout: 5000 },
   async (t) => {
     const redis = createFakeRedis(1000)
@@ -57,7 +82,7 @@ test(
       ttl: 5,
       fetch: async () => {
         if (++calls === 1) return 'initial'
-        redis.advanceTime(20_000)
+        redis.advanceTime(1_000)
         throw new Error('Upstream service unavailable')
       },
     })
@@ -100,6 +125,49 @@ test(
   },
 )
 
+test('Inline refresh propagates the fetch error when the snapshot expires', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  const failure = new Error('upstream unavailable')
+  const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache<string>({
+    key: 'inline-expiry',
+    ttl: 1,
+    staleMultiplier: 2,
+    fetch: async () => {
+      redis.advanceTime(1000)
+      throw failure
+    },
+  })
+  await cache.set(undefined, 'stale')
+  redis.advanceTime(1000)
+  await assert.rejects(cache.get(), (err) => err === failure)
+})
+
+for (const stage of ['acquire', 'poll'] as const) {
+  test(`Expired snapshot cannot mask a Redis ${stage} failure`, async (t) => {
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    const cache = createSwrClient({
+      redis,
+      mode: 'wait-on-stale',
+      failureStrategy: 'protect-source',
+      pollIntervalMs: 1,
+    }).cache({ key: 'redis-expiry', ttl: 1, staleMultiplier: 2, fetch: async () => 'fresh' })
+    await cache.set(undefined, 'stale')
+    redis.advanceTime(1000)
+    const failAtExpiry = async () => {
+      redis.advanceTime(1000)
+      throw new Error('Redis unavailable')
+    }
+    if (stage === 'acquire') interceptAcquire(redis, failAtExpiry)
+    else {
+      await redis.set(toLockKey('redis-expiry'), 'owner', 'PX', 5000)
+      redis.mgetBuffer = failAtExpiry
+    }
+    await assert.rejects(cache.get(), SwrRedisError)
+  })
+}
+
 for (const failure of ['read', 'acquire', 'poll'] as const) {
   for (const failureStrategy of ['availability', 'protect-source'] as const) {
     test(
@@ -107,17 +175,24 @@ for (const failure of ['read', 'acquire', 'poll'] as const) {
       { timeout: 5000 },
       async () => {
         const redis = createFakeRedis()
+        const err = new Error('Command timed out')
         const fail = async () => {
-          throw new Error('Command timed out')
+          throw err
         }
         if (failure === 'read') redis.getBuffer = fail
-        else if (failure === 'acquire') failAcquire(redis, new Error('Command timed out'))
+        else if (failure === 'acquire') failAcquire(redis, err)
         else {
           await redis.set(toLockKey('redis-failure'), 'other-owner', 'PX', 5000)
           redis.mgetBuffer = fail
         }
         let fetches = 0
-        const cache = createSwrClient({ redis, failureStrategy, pollIntervalMs: 1 }).cache({
+        const events: SwrEvent[] = []
+        const cache = createSwrClient({
+          redis,
+          failureStrategy,
+          pollIntervalMs: 1,
+          onEvent: (event) => events.push(event),
+        }).cache({
           key: 'redis-failure',
           ttl: () => assert.fail('direct fallback bypasses TTL resolution'),
           fetch: async (_ctx, { cacheWrite }) => {
@@ -133,6 +208,19 @@ for (const failure of ['read', 'acquire', 'poll'] as const) {
             (err) => err instanceof SwrRedisError && err.key === 'redis-failure',
           )
         assert.equal(fetches, failureStrategy === 'availability' ? 1 : 0)
+        assert.deepEqual(
+          events.filter((event) => event.type === 'error'),
+          [
+            {
+              type: 'error',
+              key: 'redis-failure',
+              keys: ['redis-failure'],
+              err,
+              reason: failureStrategy === 'availability' ? 'redis_error_fallback' : 'redis_error',
+              severity: failureStrategy === 'availability' ? 'warn' : 'error',
+            },
+          ],
+        )
       },
     )
   }
@@ -160,33 +248,67 @@ test(
 for (const failureStrategy of ['availability', 'protect-source'] as const) {
   for (const operation of ['stale acquire', 'stale poll snapshot'] as const) {
     test(
-      `failureStrategy ${failureStrategy}: ${operation} error preserves the stale fallback policy`,
+      `failureStrategy ${failureStrategy}: ${operation} error serves the stale snapshot without fetching`,
       { timeout: 2000 },
       async (t) => {
         const redis = createFakeRedis(1000)
         useRedisClock(t, redis)
+        const events: SwrEvent[] = []
+        let fetches = 0
+        let acquireCalls = 0
+        const polling = operation === 'stale poll snapshot'
+        const snapshot = polling ? undefined : 'stale'
         const cache = createSwrClient({
           redis,
           failureStrategy,
-          mode: 'wait-on-stale',
+          mode: polling ? 'wait-on-stale' : 'swr',
           pollIntervalMs: 1,
-        }).cache<string>({
+          onEvent: (e) => events.push(e),
+        }).cache<string | undefined>({
           key: 'stale-failure',
           ttl: 1,
-          fetch: async () => assert.fail('stale Redis error must not fetch directly'),
+          fetch: async () => `fetched-${++fetches}`,
         })
-        await cache.set(undefined, 'stale')
+        await cache.set(undefined, snapshot)
         redis.advanceTime(1500)
-        const fail = async () => {
-          throw new Error('Redis unavailable')
-        }
-        if (operation === 'stale acquire') failAcquire(redis, new Error('Redis unavailable'))
-        else {
+        const failure = new Error('Redis unavailable')
+        if (!polling) {
+          interceptAcquire(redis, async (acquire, ...args) => {
+            assert.equal(await acquire(...args), true)
+            throw failure
+          })
+        } else {
           await redis.set(toLockKey('stale-failure'), 'owner', 'PX', 5000)
-          redis.mgetBuffer = fail
+          interceptAcquire(redis, (acquire, ...args) => {
+            acquireCalls++
+            return acquire(...args)
+          })
+          redis.mgetBuffer = async () => {
+            throw failure
+          }
         }
-        if (failureStrategy === 'availability') assert.equal(await cache.get(), 'stale')
-        else await assert.rejects(cache.get(), SwrRedisError)
+        assert.equal(await cache.get(), snapshot)
+        assert.equal(fetches, 0)
+        assert.equal(await redis.get(toLockKey('stale-failure')), polling ? 'owner' : null)
+        if (polling) assert.equal(acquireCalls, 1)
+        assert.deepEqual(
+          events.map((e) =>
+            e.type === 'hit'
+              ? `hit:${e.stale}:${e.startedRevalidation}`
+              : e.type === 'poll'
+                ? `poll:${e.outcome}`
+                : e.type,
+          ),
+          polling ? ['hit:true:false', 'poll:error', 'error'] : ['hit:true:false', 'error'],
+        )
+        assert.deepEqual(events.at(-1), {
+          type: 'error',
+          reason: 'stale_fallback',
+          severity: 'warn',
+          key: 'stale-failure',
+          stage: 'redis',
+          err: failure,
+        })
       },
     )
   }
@@ -314,7 +436,12 @@ for (const phase of ['cold', 'stale'] as const) {
       useRedisClock(t, redis)
       const entered = Promise.withResolvers<void>()
       let calls = 0
-      const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache({
+      const events: SwrEvent[] = []
+      const cache = createSwrClient({
+        redis,
+        mode: 'swr-serverless',
+        onEvent: (event) => events.push(event),
+      }).cache({
         key: 'inline-abort',
         ttl: 1,
         fetch: async (_ctx, { signal }) => {
@@ -337,6 +464,10 @@ for (const phase of ['cold', 'stale'] as const) {
       controller.abort(reason)
       await assert.rejects(pending, (error) => error === reason)
       assert.equal(await redis.get(toLockKey('inline-abort')), null)
+      assert.equal(
+        events.some((event) => event.type === 'error'),
+        false,
+      )
     },
   )
 
@@ -347,11 +478,13 @@ for (const phase of ['cold', 'stale'] as const) {
       const redis = createFakeRedis(1000)
       useRedisClock(t, redis)
       const waiting = Promise.withResolvers<void>()
+      const events: SwrEvent[] = []
       const cache = createSwrClient({
         redis,
         mode: 'wait-on-stale',
         pollIntervalMs: 1,
         onEvent: (event) => {
+          events.push(event)
           if (
             (event.type === 'miss' && event.action === 'wait') ||
             (event.type === 'hit' && event.stale && !event.startedRevalidation)
@@ -376,6 +509,10 @@ for (const phase of ['cold', 'stale'] as const) {
       controller.abort(reason)
       await assert.rejects(pending, (error) => error === reason)
       assert.equal(await redis.get(toLockKey('poll-abort')), 'other-owner')
+      assert.deepEqual(
+        events.map((event) => (event.type === 'poll' ? event.outcome : event.type)),
+        [phase === 'cold' ? 'miss' : 'hit', 'cancelled'],
+      )
     },
   )
 }
@@ -618,6 +755,7 @@ for (const [phase, acquireOutcome] of [
       const key = `abort-init-lock:${phase}`
       const events: SwrEvent[] = []
       let waitUntilCalls = 0
+      let fetches = 0
       const cache = createSwrClient({
         redis,
         mode: 'swr',
@@ -628,7 +766,7 @@ for (const [phase, acquireOutcome] of [
       }).cache<string>({
         key,
         ttl: 5,
-        fetch: async () => assert.fail('aborted initial lock must not fetch'),
+        fetch: async () => `fetched-${++fetches}`,
       })
 
       if (phase === 'stale') {
@@ -662,6 +800,7 @@ for (const [phase, acquireOutcome] of [
       await assert.rejects(pending, (err) => err === reason)
       assert.equal(waitUntilCalls, 0)
       assert.deepEqual(events, [])
+      assert.equal(fetches, 0)
       assert.equal(await redis.get(toLockKey(key)), null)
     },
   )

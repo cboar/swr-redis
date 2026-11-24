@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { disabledMemory, type LruMemory } from '../src/memory.ts'
-import { resolveMemory } from '../src/options.ts'
+import type { LruMemory } from '../src/memory.ts'
 import { createLruMemory } from './helpers/memory-harness.ts'
 import type { CacheEnvelope } from '../src/codec.ts'
 
@@ -21,18 +20,6 @@ function populate(memory: LruMemory, key: string, stored: CacheEnvelope<unknown>
   memory.populate(read, stored, now)
   memory.endRead(read)
 }
-
-test('LruMemory: memory option undefined or false resolves to the no-op disabled store', () => {
-  assert.equal(resolveMemory(undefined), undefined)
-  assert.equal(resolveMemory(false), undefined)
-  const read = disabledMemory.beginRead('key')
-  disabledMemory.populate(read, envelope(1), 1000)
-  disabledMemory.endRead(read)
-  const pending = disabledMemory.beginWrite([{ key: 'key', envelope: envelope(2) }])
-  disabledMemory.settle(pending, 'populate')
-  assert.deepEqual(pending, [])
-  assert.equal(disabledMemory.get('key', 1000), undefined)
-})
 
 test('LruMemory: evicts the least recently used entry at capacity; reads and writes refresh recency', () => {
   const memory = createLruMemory({ maxEntries: 2 })

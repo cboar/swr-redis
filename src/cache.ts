@@ -57,8 +57,8 @@ type PreparedFetch<T> =
       durationMs: number
     }
 
-/** A stale value to fall back to, boxed because `undefined` is a valid cached value. */
-type StaleFallback<T> = { value: T }
+/** A stale value to fall back to while still within its expiry window, boxed because `undefined` is a valid cached value. */
+type StaleFallback<T> = { value: T; expiresAtMs: number }
 
 type PollSnapshot<T> =
   | { status: 'hit'; value: T }
@@ -78,6 +78,7 @@ interface PollProgress {
 
 type PollOutcome = Extract<SwrEvent, { type: 'poll' }>['outcome']
 type RefreshTrigger = Extract<SwrEvent, { type: 'refresh' }>['trigger']
+type StaleFallbackStage = Extract<SwrEvent, { reason: 'stale_fallback' }>['stage']
 
 export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Context> {
   private readonly client: ClientInternals
@@ -141,7 +142,12 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
     const { entry } = read
     if (!entry) return await this.onColdMiss(req)
-    if (!entry.fresh) return await this.onStaleHit(req, { value: entry.envelope.value })
+    if (!entry.fresh) {
+      return await this.onStaleHit(req, {
+        value: entry.envelope.value,
+        expiresAtMs: entry.envelope.expiresAtMs,
+      })
+    }
     this.emit?.({ type: 'hit', key, source: 'redis', stale: false, startedRevalidation: false })
     return entry.envelope.value
   }
@@ -220,25 +226,24 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 
   private async onStaleHit(req: CacheRequest<Context>, stale: StaleFallback<T>): Promise<T> {
-    const { mode, failureStrategy } = this.options
+    const { mode } = this.options
     const { key } = req
     const attempt = await this.tryLock(req)
-    if (attempt.status === 'redis_error') {
-      // Under protect-source the Redis error is thrown and the stale value is never served.
-      if (failureStrategy !== 'protect-source') {
-        this.emit?.({ type: 'hit', key, source: 'redis', stale: true, startedRevalidation: false })
-      }
-      return await this.onRedisError(req, attempt.err, stale)
-    }
-
     const acquired = attempt.status === 'acquired'
+    const usable = isStaleUsable(stale)
     this.emit?.({ type: 'hit', key, source: 'redis', stale: true, startedRevalidation: acquired })
 
+    if (attempt.status === 'redis_error') {
+      return usable
+        ? this.serveStaleAfterError(key, stale, 'redis', attempt.err)
+        : await this.onRedisError(req, attempt.err)
+    }
     if (!acquired) {
+      if (!usable) return await this.poll(req)
       return mode === 'wait-on-stale' ? await this.poll(req, stale) : stale.value
     }
 
-    if (mode === 'swr') {
+    if (mode === 'swr' && usable) {
       // The background refresh must outlive the caller's request and its abort signal.
       const background = { ...req, signal: undefined }
       const refresh = this.refresh(background, attempt.lock, 'stale_revalidation', stale)
@@ -246,7 +251,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       return stale.value
     }
 
-    return await this.refresh(req, attempt.lock, 'stale_revalidation', stale)
+    return await this.refresh(req, attempt.lock, 'stale_revalidation', usable ? stale : undefined)
   }
 
   private async onColdMiss(req: CacheRequest<Context>): Promise<T> {
@@ -268,7 +273,14 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     try {
       result = await this.waitForEntry(req, stale, progress)
     } catch (err) {
-      this.emitPoll(req, req.signal?.aborted ? 'cancelled' : 'error', progress)
+      if (req.signal?.aborted) {
+        this.emitPoll(req, 'cancelled', progress)
+        throw req.signal.reason
+      }
+      this.emitPoll(req, 'error', progress)
+      // waitForEntry only throws non-abort errors from decodeAndPopulate.
+      if (stale && isStaleUsable(stale))
+        return this.serveStaleAfterError(req.key, stale, 'read', err)
       throw err
     }
     this.emitPoll(
@@ -283,7 +295,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       case 'stale_fallback':
         return result.value
       case 'timeout': {
-        if (stale) return stale.value
+        if (stale && isStaleUsable(stale)) return stale.value
         if (this.options.failureStrategy !== 'protect-source') return await this.fetchDirect(req)
         const durationMs = result.elapsedMs
         const err = new SwrTimeoutError(req.key, durationMs)
@@ -291,7 +303,9 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         throw err
       }
       case 'error':
-        return await this.onRedisError(req, result.err, stale)
+        return stale && isStaleUsable(stale)
+          ? this.serveStaleAfterError(req.key, stale, 'redis', result.err)
+          : await this.onRedisError(req, result.err)
       case 'lock_stolen':
         return await this.refresh(req, result.lock, 'lock_stolen')
     }
@@ -303,7 +317,6 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     progress: PollProgress,
   ): Promise<WaitResult<T>> {
     const { waitTimeoutMs, pollIntervalMs } = this.options
-    const accept: Accept = stale ? 'fresh' : 'usable'
     const { signal } = req
 
     while (true) {
@@ -315,11 +328,12 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       signal?.throwIfAborted()
 
       progress.attempts++
+      const accept: Accept = stale && isStaleUsable(stale) ? 'fresh' : 'usable'
       const snapshot = await this.pollSnapshot(req, accept)
       if (snapshot.status === 'redis_error') return { outcome: 'error', err: snapshot.err }
       if (snapshot.status === 'hit') return { outcome: 'resolved', value: snapshot.value }
       if (snapshot.status === 'locked') continue
-      if (stale) return { outcome: 'stale_fallback', value: stale.value }
+      if (stale && isStaleUsable(stale)) return { outcome: 'stale_fallback', value: stale.value }
 
       const attempt = await this.tryLock(req)
       if (attempt.status === 'redis_error') return { outcome: 'error', err: attempt.err }
@@ -360,13 +374,19 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     })
   }
 
-  private async onRedisError(
-    req: CacheRequest<Context>,
-    err: unknown,
-    stale?: StaleFallback<T>,
-  ): Promise<T> {
+  private async onRedisError(req: CacheRequest<Context>, err: unknown): Promise<T> {
     this.reportRedisError(req.key, err)
-    return stale ? stale.value : await this.fetchDirect(req)
+    return await this.fetchDirect(req)
+  }
+
+  private serveStaleAfterError(
+    key: string,
+    stale: StaleFallback<T>,
+    stage: StaleFallbackStage,
+    err: unknown,
+  ): T {
+    this.emit?.(errorEvent('stale_fallback', key, { stage, err }))
+    return stale.value
   }
 
   private reportRedisError(key: string, err: unknown): void {
@@ -383,10 +403,13 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     if (isFatalError(err, this.options.isFatal)) {
       this.emit?.(errorEvent('fatal', req.key, { err }))
       if (this.options.mode !== 'swr') throw err
-    } else {
-      this.emit?.(errorEvent('fetch_stale_fallback', req.key, { err }))
+      return stale.value
     }
-    return stale.value
+    if (this.options.mode !== 'swr' && !isStaleUsable(stale)) {
+      this.emit?.(errorEvent('fetch_cold_failure', req.key, { err }))
+      throw err
+    }
+    return this.serveStaleAfterError(req.key, stale, 'refresh', err)
   }
 
   private async fetchDirect(req: CacheRequest<Context>): Promise<T> {
@@ -559,17 +582,18 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 }
 
+function isStaleUsable(stale: StaleFallback<unknown>): boolean {
+  return Date.now() < stale.expiresAtMs
+}
+
 function decodeEntry<T>(buf: Buffer | null, accept: Accept, codec: SwrCodec<T>) {
   if (!buf) return undefined
   const header = readEnvelopeHeader(buf)
-  const deadlineMs = accept === 'fresh' ? header.freshUntilMs : header.expiresAtMs
-  if (Date.now() >= deadlineMs) return undefined
-
-  const value = decodeEnvelopeValue(buf, header, codec)
-  // A slow decode can cross the deadline.
   const now = Date.now()
+  const deadlineMs = accept === 'fresh' ? header.freshUntilMs : header.expiresAtMs
   if (now >= deadlineMs) return undefined
 
+  const value = decodeEnvelopeValue(buf, header, codec)
   const { cachedAtMs, freshUntilMs, expiresAtMs } = header
   return {
     fresh: now < freshUntilMs,

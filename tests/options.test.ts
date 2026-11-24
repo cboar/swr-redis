@@ -212,22 +212,25 @@ test('Options validation: enforces merged cross-layer resolved Redis TTL ceiling
   })
 })
 
-test('Options: memory is disabled when the client omits it', async (t) => {
-  const redis = createFakeRedis(1000)
-  useRedisClock(t, redis)
-  let reads = 0
-  const getBuffer = redis.getBuffer.bind(redis)
-  redis.getBuffer = (key: string) => {
-    reads++
-    return getBuffer(key)
+test('Options: omitting memory or setting it to false uses Redis on each read', async (t) => {
+  for (const options of [{}, { memory: false }] as const) {
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    let reads = 0
+    const getBuffer = redis.getBuffer.bind(redis)
+    redis.getBuffer = (key: string) => {
+      reads++
+      return getBuffer(key)
+    }
+    let fetches = 0
+    const cache = createSwrClient({ redis, ttl: 60, ...options }).cache({
+      key: 'no-memory',
+      fetch: async () => `val-${++fetches}`,
+    })
+    assert.equal(await cache.get(), 'val-1')
+    assert.equal(await cache.get(), 'val-1')
+    assert.deepEqual([fetches, reads], [1, 2])
   }
-  let fetches = 0
-  const cache = createSwrClient({ redis, ttl: 60 }).cache({
-    key: 'no-memory-default',
-    fetch: async () => `val-${++fetches}`,
-  })
-  for (let i = 0; i < 3; i++) assert.equal(await cache.get(), 'val-1')
-  assert.deepEqual([fetches, reads], [1, 3])
 })
 
 test('Options validation: validates client-only memory options', () => {

@@ -35,9 +35,10 @@ that repopulated value out of date for its entire fresh and stale lifetime.
 
 ## The writer sets freshness and expiry
 
-The envelope header stores the writer's timestamps so readers can reject
-unusable entries before decoding the payload. Readers check again afterward
-because decoding can cross a deadline.
+Each envelope starts with a 25-byte header containing a compression flag byte and
+three big-endian float64 timestamps for write time, freshness, and expiry. The
+header lets readers reject unusable entries before decoding the payload.
+Read timing is best-effort during synchronous decoding, so one clock read suffices.
 
 Readers honor the writer's deadlines even when configured with different TTLs.
 Redis expiry is rounded up to whole seconds for key cleanup. The deadlines use
@@ -45,18 +46,16 @@ wall-clock time, so clock skew between writers and readers affects how long
 entries appear fresh or usable. The format version lives in the Redis key
 namespace to keep incompatible envelopes apart.
 
-## Failure policy depends on whether the source has been called
+## Fallbacks avoid uncoordinated source load and writes
 
-When Redis fails before a fetch, `availability` serves the stale snapshot when
-available or fetches directly. That direct fetch skips all cache writes because
-it holds no lease. `protect-source` fails the request to avoid sending
-uncoordinated traffic to the source. The same choice applies on a cold-miss
-timeout. On a stale wait, both strategies return the original snapshot if the
-wait times out or the lease clears without a fresh entry. Serving the snapshot
-adds no source load, even if it expired during the wait.
-
-Once the fetched value is ready to commit, both strategies return it if the
-cache write fails or ownership is lost. The source has already done the work.
+An already-read stale snapshot is re-checked against `expiresAtMs` after async
+lock acquisition, polling, and inline fetches so an expired snapshot is not
+served; once expired, the call falls back to the normal cold-miss or error path
+(background `'swr'` refreshes still settle without rejecting after returning a
+valid snapshot). Without a usable snapshot, decode, decompression, and
+memory-clone errors throw without fetching so a codec mismatch or corrupt entry
+cannot trigger a fetch storm. Direct fallback fetches under `availability` skip
+all cache writes because they hold no lease.
 
 ## Memory cache consistency
 

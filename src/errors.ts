@@ -13,7 +13,7 @@ export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boo
   return customIsFatal?.(err) ?? false
 }
 
-/** Thrown under `'protect-source'` when waiting on a cold miss exceeds `waitTimeout`. */
+/** Thrown under `'protect-source'` when waiting exceeds `waitTimeout` with no stale value to serve. */
 export class SwrTimeoutError extends SwrCacheError {
   readonly key: string
   readonly elapsedMs: number
@@ -26,7 +26,7 @@ export class SwrTimeoutError extends SwrCacheError {
   }
 }
 
-/** Thrown under `'protect-source'` when Redis fails before a fetch or during `set`, `invalidate`, or `invalidateKeys`. */
+/** Thrown under `'protect-source'` when Redis fails before a fetch with no stale value to serve, or during `set`, `invalidate`, or `invalidateKeys`. */
 export class SwrRedisError extends SwrCacheError {
   readonly key: string
   readonly keys: SwrNonEmptyKeys
