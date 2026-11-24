@@ -1,4 +1,4 @@
-import type { CacheEnvelope } from './codec.ts'
+import type { Envelope } from './codec.ts'
 import type { ResolvedMemory } from './options.ts'
 
 export interface ReadGuard {
@@ -9,7 +9,7 @@ export interface ReadGuard {
 /** A write to settle into memory; without `envelope` the key is only evicted. */
 export interface MemoryWrite {
   key: string
-  envelope?: CacheEnvelope<unknown>
+  envelope?: Envelope<unknown>
 }
 
 export type PendingWrites = ReadonlyArray<MemoryWrite & { version: number }>
@@ -18,10 +18,10 @@ export type SettleOutcome = 'populate' | 'evict'
 
 export interface MemoryStore {
   readonly clones: boolean
-  get<T>(key: string, now: number): { value: T } | undefined
+  get<T>(key: string, now: number): Envelope<T> | undefined
   beginRead(key: string): ReadGuard
   endRead(guard: ReadGuard | undefined): void
-  populate(guard: ReadGuard | undefined, envelope: CacheEnvelope<unknown>, now: number): void
+  populate(guard: ReadGuard | undefined, envelope: Envelope<unknown>, now: number): void
   beginWrite(writes: readonly MemoryWrite[]): PendingWrites
   settle(pending: PendingWrites, outcome: SettleOutcome): void
 }
@@ -40,7 +40,7 @@ export class LruMemory implements MemoryStore {
   readonly clones: boolean
   private readonly maxEntries: number
   private readonly maxTtlMs: number
-  private readonly entries = new Map<string, CacheEnvelope<unknown>>()
+  private readonly entries = new Map<string, Envelope<unknown>>()
   private readonly versions = new KeyVersions()
 
   constructor(options: ResolvedMemory) {
@@ -57,15 +57,18 @@ export class LruMemory implements MemoryStore {
     return this.versions.size
   }
 
-  get<T>(key: string, now: number): { value: T } | undefined {
+  get<T>(key: string, now: number): Envelope<T> | undefined {
     const entry = this.entries.get(key)
     if (!entry) return undefined
 
     this.entries.delete(key)
-    if (now >= entry.freshUntilMs || now >= entry.cachedAtMs + this.maxTtlMs) return undefined
+    const { freshUntilMs, cachedAtMs } = entry.timing
+    if (now >= freshUntilMs || now - cachedAtMs >= this.maxTtlMs) return undefined
 
     this.entries.set(key, entry) // most recently used
-    return { value: (this.clones ? structuredClone(entry.value) : entry.value) as T }
+    return (
+      this.clones ? { value: structuredClone(entry.value), timing: entry.timing } : entry
+    ) as Envelope<T>
   }
 
   beginRead(key: string): ReadGuard {
@@ -76,8 +79,8 @@ export class LruMemory implements MemoryStore {
     if (guard) this.versions.release(guard.key)
   }
 
-  populate(guard: ReadGuard | undefined, envelope: CacheEnvelope<unknown>, now: number): void {
-    if (!guard || now >= envelope.cachedAtMs + this.maxTtlMs) return
+  populate(guard: ReadGuard | undefined, envelope: Envelope<unknown>, now: number): void {
+    if (!guard || now - envelope.timing.cachedAtMs >= this.maxTtlMs) return
     if (this.versions.current(guard.key) !== guard.version) return
     if (!this.clones) {
       this.store(guard.key, envelope)
@@ -87,7 +90,7 @@ export class LruMemory implements MemoryStore {
     // structuredClone runs property getters. A getter that calls set() or invalidate() can finish
     // that write synchronously (its Redis call throws), so check the version again.
     if (this.versions.current(guard.key) !== guard.version) return
-    this.store(guard.key, { ...envelope, value })
+    this.store(guard.key, { value, timing: envelope.timing })
   }
 
   beginWrite(writes: readonly MemoryWrite[]): PendingWrites {
@@ -107,7 +110,7 @@ export class LruMemory implements MemoryStore {
     }
   }
 
-  private store(key: string, envelope: CacheEnvelope<unknown>): void {
+  private store(key: string, envelope: Envelope<unknown>): void {
     if (this.entries.has(key)) {
       this.entries.delete(key)
     } else if (this.entries.size >= this.maxEntries) {

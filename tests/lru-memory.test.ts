@@ -2,20 +2,18 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { LruMemory } from '../src/memory.ts'
 import { createLruMemory } from './helpers/memory-harness.ts'
-import type { CacheEnvelope } from '../src/codec.ts'
+import type { Envelope } from '../src/codec.ts'
 
-const envelope = <T>(value: T): CacheEnvelope<T> => ({
+const envelope = <T>(value: T): Envelope<T> => ({
   value,
-  cachedAtMs: 1000,
-  freshUntilMs: 11_000,
-  expiresAtMs: 31_000,
+  timing: { cachedAtMs: 1000, freshUntilMs: 11_000, expiresAtMs: 31_000 },
 })
 
-function write(memory: LruMemory, key: string, stored: CacheEnvelope<unknown>): void {
+function write(memory: LruMemory, key: string, stored: Envelope<unknown>): void {
   memory.settle(memory.beginWrite([{ key, envelope: stored }]), 'populate')
 }
 
-function populate(memory: LruMemory, key: string, stored: CacheEnvelope<unknown>, now = 1000) {
+function populate(memory: LruMemory, key: string, stored: Envelope<unknown>, now = 1000) {
   const read = memory.beginRead(key)
   memory.populate(read, stored, now)
   memory.endRead(read)
@@ -49,15 +47,15 @@ test('LruMemory: lifetime ends at stored freshness or the non-sliding maxTtl fro
   ]
   for (const [name, freshUntilMs, populateAt, lastHit] of cases) {
     const memory = createLruMemory({ maxTtl: 1 })
-    const stored = { ...envelope(name), freshUntilMs }
+    const stored = { value: name, timing: { cachedAtMs: 1000, freshUntilMs, expiresAtMs: 31_000 } }
     if (populateAt === undefined) write(memory, 'key', stored)
     else populate(memory, 'key', stored, populateAt)
     if (lastHit === undefined) {
       assert.equal(memory.entryCount, 0, name)
       continue
     }
-    assert.deepEqual(memory.get('key', lastHit - 300), { value: name }, name)
-    assert.deepEqual(memory.get('key', lastHit), { value: name }, name)
+    assert.deepEqual(memory.get('key', lastHit - 300), stored, name)
+    assert.deepEqual(memory.get('key', lastHit), stored, name)
     assert.equal(memory.get('key', lastHit + 1), undefined, name)
     assert.equal(memory.entryCount, 0, name)
   }

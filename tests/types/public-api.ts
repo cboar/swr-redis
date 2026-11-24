@@ -5,8 +5,10 @@ import {
   SwrWriteBatch,
   type SwrCache,
   type SwrCacheWrite,
+  type SwrEntryTiming,
   type SwrErrorReason,
   type SwrFetchMeta,
+  type SwrGetResult,
   type SwrNonEmptyKeys,
   type SwrSharedOptions,
   type SwrTtlInput,
@@ -35,10 +37,14 @@ const settingsCache = swr.cache({
 })
 expectType<SwrCache<{ theme: 'dark' }, void>>(settingsCache)
 expectType<Promise<{ theme: 'dark' }>>(settingsCache.get())
+expectType<Promise<SwrGetResult<{ theme: 'dark' }>>>(settingsCache.getWithMeta())
 expectType<Promise<{ theme: 'dark' }>>(settingsCache.get(undefined, { memory: false }))
 expectType<Promise<void>>(settingsCache.set(undefined, { theme: 'dark' }))
 expectType<Promise<void>>(settingsCache.invalidate())
 expectType<string>(settingsCache.key())
+declare const getResult: SwrGetResult<{ theme: 'dark' }>
+expectType<'memory' | 'redis' | 'fetch'>(getResult.source)
+expectType<SwrEntryTiming | undefined>(getResult.timing)
 
 // Function key -> Context is inferred from key and flows into fetch.
 const userCache = swr.cache({

@@ -60,9 +60,11 @@ test('25-byte envelope header: small payloads stay raw, large payloads compress,
   assert.equal(smallBuf[0], 0x00)
   assert.deepEqual(readEnvelopeHeader(smallBuf), {
     deflated: false,
-    cachedAtMs: 1000,
-    freshUntilMs: 6000,
-    expiresAtMs: 26000,
+    timing: {
+      cachedAtMs: 1000,
+      freshUntilMs: 6000,
+      expiresAtMs: 26000,
+    },
   })
   assert.deepEqual(decodeEnvelope<string>(smallBuf), smallEnv)
 

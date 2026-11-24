@@ -312,3 +312,61 @@ test('Oversized dynamic resolved Redis TTL (including staleMultiplier) throws Sw
   assert.deepEqual(await redis.getBuffer(toDataKey('oversized-ttl')), before)
   assert.equal(await seed.get(), 'existing')
 })
+
+test('getWithMeta reports source and timing across fetch, memory, Redis, and stale hits', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  let calls = 0
+  const swr = createSwrClient({ redis, memory: true, ttl: 2, staleMultiplier: 3 })
+  const cache = swr.cache({ key: 'meta', fetch: async () => `v${++calls}` })
+  const expectedTiming = { cachedAtMs: 1000, freshUntilMs: 3000, expiresAtMs: 7000 }
+
+  assert.deepEqual(await cache.getWithMeta(), {
+    value: 'v1',
+    source: 'fetch',
+    timing: expectedTiming,
+  })
+
+  redis.advanceTime(500)
+  assert.deepEqual(await cache.getWithMeta(), {
+    value: 'v1',
+    source: 'memory',
+    timing: expectedTiming,
+  })
+
+  assert.deepEqual(await cache.getWithMeta(undefined, { memory: false }), {
+    value: 'v1',
+    source: 'redis',
+    timing: expectedTiming,
+  })
+
+  redis.advanceTime(2000)
+  assert.deepEqual(await cache.getWithMeta(), {
+    value: 'v1',
+    source: 'redis',
+    timing: expectedTiming,
+  })
+  await swr.flush()
+})
+
+test('getWithMeta omits timing for uncached SwrNoCache and fallback fetches', async () => {
+  const redis = createFakeRedis()
+  const swr = createSwrClient({ redis })
+  const noCache = swr.cache({
+    key: 'no-cache',
+    fetch: async () => new SwrNoCache('uncached'),
+  })
+  assert.deepEqual(await noCache.getWithMeta(), {
+    value: 'uncached',
+    source: 'fetch',
+  })
+
+  redis.getBuffer = async () => {
+    throw new Error('redis down')
+  }
+  const fallback = swr.cache({ key: 'fallback', fetch: async () => 'direct' })
+  assert.deepEqual(await fallback.getWithMeta(), {
+    value: 'direct',
+    source: 'fetch',
+  })
+})
