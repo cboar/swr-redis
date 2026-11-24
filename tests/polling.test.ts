@@ -5,7 +5,7 @@ import { setImmediate } from 'node:timers/promises'
 import { pollDelayMs } from '../src/cache.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
-import { createSwrClient, SwrTimeoutError } from '../src/index.ts'
+import { createSwrClient, SwrTimeoutError, type SwrEvent } from '../src/index.ts'
 import { encodeEnvelope } from './helpers/envelope.ts'
 import { holdLock, interceptAcquire } from './helpers/acquire.ts'
 import { createFakeRedis } from './fake-redis.ts'
@@ -99,10 +99,12 @@ test(
       return get(key)
     }
     const waiting = Promise.withResolvers<void>()
+    const events: SwrEvent[] = []
     const cache = createSwrClient({
       redis,
       pollIntervalMs: 10,
       onEvent: (event) => {
+        events.push(event)
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },
     }).cache({ key: 'passive', fetch: async () => assert.fail('passive waiter must not fetch') })
@@ -126,6 +128,10 @@ test(
     assert.equal(pollSnapshots, 3)
     assert.equal(redis.evalCallCount - evals, 1)
     assert.equal(redis.setCallCount - sets, 1, 'the test write')
+    assert.deepEqual(events, [
+      { type: 'miss', key: 'passive', action: 'wait' },
+      { type: 'poll', key: 'passive', outcome: 'resolved', attempts: 3, durationMs: 30 },
+    ])
   },
 )
 
@@ -140,12 +146,14 @@ test(
     await holdLock(redis, lockKey('steal'), 30, 'crashed')
     const waiting = Promise.withResolvers<void>()
     let fetches = 0
+    const events: SwrEvent[] = []
     const cache = createSwrClient({
       redis,
       pollIntervalMs: 10,
       waitTimeout: 0.03,
       failureStrategy: 'protect-source',
       onEvent: (event) => {
+        events.push(event)
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },
     }).cache({
@@ -163,6 +171,11 @@ test(
     assert.equal(fetches, 1)
     assert.equal(await redis.get(lockKey('steal')), null)
     assert.ok(await redis.getBuffer(dataKey('steal')))
+    assert.deepEqual(events, [
+      { type: 'miss', key: 'steal', action: 'wait' },
+      { type: 'poll', key: 'steal', outcome: 'lock_stolen', attempts: 1, durationMs: 30 },
+      { type: 'refresh', key: 'steal', trigger: 'lock_stolen', durationMs: 0 },
+    ])
   },
 )
 
@@ -184,12 +197,14 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
       }) as typeof redis.mgetBuffer
       const waiting = Promise.withResolvers<void>()
       let fetches = 0
+      const events: SwrEvent[] = []
       const cache = createSwrClient({
         redis,
         failureStrategy,
         waitTimeout: 0.03,
         pollIntervalMs: 10,
         onEvent: (event) => {
+          events.push(event)
           if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
         },
       }).cache({
@@ -213,6 +228,17 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
       await result
       assert.equal(fetches, failureStrategy === 'availability' ? 1 : 0)
       assert.equal(pollSnapshots, 1)
+      assert.deepEqual(events.slice(0, 2), [
+        { type: 'miss', key: 'timeout', action: 'wait' },
+        { type: 'poll', key: 'timeout', outcome: 'timeout', attempts: 1, durationMs: 30 },
+      ])
+      if (failureStrategy === 'protect-source') {
+        assert.equal(events.length, 3)
+        const error = events[2]
+        assert.ok(error?.type === 'error' && error.reason === 'timeout')
+        assert.equal(error.severity, 'error')
+        assert.equal(error.durationMs, 30)
+      } else assert.equal(events.length, 2)
     },
   )
 }
@@ -357,7 +383,7 @@ for (const { name, freshUntilMs, expected } of [
   })
 }
 
-for (const scenario of ['timeout', 'unlocked', 'redis_error'] as const) {
+for (const scenario of ['timeout', 'unlocked'] as const) {
   test(
     `Stale poll with cached undefined preserves stale policy on ${scenario}`,
     { timeout: 2000 },
@@ -382,22 +408,20 @@ for (const scenario of ['timeout', 'unlocked', 'redis_error'] as const) {
 
       const waiting = Promise.withResolvers<void>()
       let acquireCalls = 0
+      let fetches = 0
+      const events: SwrEvent[] = []
       interceptAcquire(redis, (acquire, ...args) => {
         acquireCalls++
         return acquire(...args)
       })
 
-      const origMget = redis.mgetBuffer.bind(redis)
-      redis.mgetBuffer = (async (...keys: string[]) => {
-        if (scenario === 'unlocked') {
+      if (scenario === 'unlocked') {
+        const origMget = redis.mgetBuffer.bind(redis)
+        redis.mgetBuffer = (async (...keys: string[]) => {
           await redis.unlink(lockKey(key))
           return origMget(...keys)
-        }
-        if (scenario === 'redis_error') {
-          throw new Error('mget failed')
-        }
-        return origMget(...keys)
-      }) as typeof redis.mgetBuffer
+        }) as typeof redis.mgetBuffer
+      }
 
       const cache = createSwrClient({
         redis,
@@ -406,11 +430,12 @@ for (const scenario of ['timeout', 'unlocked', 'redis_error'] as const) {
         waitTimeout: 0.03,
         pollIntervalMs: scenario === 'timeout' ? 10 : 1,
         onEvent: (event) => {
+          events.push(event)
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
         },
       }).cache<string | undefined>({
         key,
-        fetch: async () => assert.fail('stale waiter must not fetch'),
+        fetch: async () => `fetched-${++fetches}`,
       })
 
       const pending = cache.get()
@@ -420,6 +445,11 @@ for (const scenario of ['timeout', 'unlocked', 'redis_error'] as const) {
       }
       assert.equal(await pending, undefined)
       assert.equal(acquireCalls, 1, 'stale waiter must not attempt lock steal')
+      assert.equal(fetches, 0)
+      assert.deepEqual(
+        events.map((event) => (event.type === 'poll' ? event.outcome : event.type)),
+        ['hit', scenario === 'timeout' ? 'timeout' : 'stale_fallback'],
+      )
     },
   )
 }

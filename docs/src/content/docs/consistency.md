@@ -21,7 +21,8 @@ On a miss, one caller fetches while others wait for the result. Pass a
 `signal` to `get()` to cancel waiting and let your fetcher cancel its work.
 Background refreshes run independently of the caller's signal.
 
-Inline refreshes can fall back to the stale value if the fetch fails. Use
+Inline refreshes fall back to the stale value if the fetch fails before the
+stale entry expires. Use
 [`isFatal`](/swr-redis/observability/#mark-fatal-fetch-errors) for errors
 that should reach the caller.
 
@@ -47,19 +48,25 @@ await redis.quit()
 ## Failure strategies
 
 Set `failureStrategy` on the client or per cache to choose how `swr-redis`
-behaves when Redis is unavailable or a cold-miss wait exceeds `waitTimeout`:
+behaves when Redis fails or a wait exceeds `waitTimeout` and no stale value can
+be served:
 
-- **`'availability'`** (default) serves a stale value when available or fetches
-  directly from the source without caching the result. Failed explicit cache
-  writes and invalidations are reported through `onEvent`.
-- **`'protect-source'`** rejects the request when Redis fails before a fetch or
-  a cold-miss wait times out. It also rejects failed explicit cache writes and
-  invalidations. See [typed errors](/swr-redis/observability/#errors).
+- **`'availability'`** (default) fetches directly from the source without
+  caching the result. Failed explicit cache writes and invalidations are
+  reported through `onEvent`.
+- **`'protect-source'`** rejects the request, as well as failed explicit cache
+  writes and invalidations. See [typed errors](/swr-redis/observability/#errors).
 
-In either strategy, callers waiting in `'wait-on-stale'` can fall back to the
-stale value when their wait times out. If a successfully prepared fetch result
-fails to reach Redis, the caller still receives the fetched value and
-`onEvent` reports the failure.
+Under either strategy, if a refresh or wait fails, an unexpired stale value can
+still be returned. The `stale_fallback` warning reports the failure. If the
+value expires during an inline refresh and the fetch fails, the caller receives
+the fetch error. If the value expires while waiting, the caller proceeds as it
+would on a cache miss. Cancellation and
+[fatal inline fetch errors](/swr-redis/observability/#mark-fatal-fetch-errors)
+still reject the request.
+
+If a successfully prepared fetch result fails to reach Redis, the caller still
+receives the fetched value and `onEvent` reports the failure.
 
 ## Write ordering
 

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ObjectId } from 'bson'
-import { createSwrClient, SwrWriteBatch, type SwrCodec } from '../src/index.ts'
+import { createSwrClient, SwrWriteBatch, type SwrCodec, type SwrEvent } from '../src/index.ts'
 import { ENVELOPE_HEADER_SIZE, readEnvelopeHeader } from '../src/codec.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
@@ -285,174 +285,125 @@ test('Header-first expiry check skips payload decoding for expired reads and sta
   assert.equal(decodes, 2)
 })
 
-test('Slow decoder crossing deadline re-evaluates freshness after decode', async (t) => {
+test('Synchronous decoder crossing deadlines keeps the pre-decode read admission', async (t) => {
   const redis = createFakeRedis(1999)
   useRedisClock(t, redis)
   const { data: dataKey } = createRedisKeys(DEFAULTS.prefix)
   const slowCodec: SwrCodec<string> = {
     encode: (v) => Buffer.from(v),
     decode: (b) => {
-      redis.advanceTime(5) // crosses freshUntilMs=2000 during decode
+      redis.advanceTime(5)
       return Buffer.from(b).toString()
     },
   }
   await redis.set(
-    dataKey('slow-decode'),
+    dataKey('slow-fresh'),
     encodeEnvelope(
-      { value: 'stale-now', cachedAtMs: 1000, freshUntilMs: 2000, expiresAtMs: 10_000 },
+      { value: 'fresh-ok', cachedAtMs: 1000, freshUntilMs: 2000, expiresAtMs: 2002 },
       slowCodec,
     ),
   )
-  let fetches = 0
   const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache({
-    key: 'slow-decode',
+    key: 'slow-fresh',
     codec: slowCodec,
-    fetch: async () => {
-      fetches++
-      return 'revalidated'
-    },
+    fetch: async () => assert.fail('must not fetch when header was fresh before decode'),
   })
-  assert.equal(await cache.get(), 'revalidated')
-  assert.equal(fetches, 1)
+  assert.equal(await cache.get(), 'fresh-ok')
 })
 
-test('Slow decoder crossing the hard deadline on an initial read treats the entry as a miss', async (t) => {
-  const redis = createFakeRedis(1999)
-  useRedisClock(t, redis)
-  const { data: dataKey } = createRedisKeys(DEFAULTS.prefix)
-  const slowCodec: SwrCodec<string> = {
-    encode: (v) => Buffer.from(v),
-    decode: (b) => {
-      redis.advanceTime(5) // crosses expiresAtMs=2000 during decode
-      return Buffer.from(b).toString()
-    },
-  }
-  await redis.set(
-    dataKey('slow-expiry'),
-    encodeEnvelope(
-      { value: 'expired-now', cachedAtMs: 1000, freshUntilMs: 1500, expiresAtMs: 2000 },
-      slowCodec,
-    ),
-  )
-  const cache = createSwrClient({ redis }).cache({
-    key: 'slow-expiry',
-    codec: slowCodec,
-    fetch: async () => 'fetched',
-  })
-  assert.equal(await cache.get(), 'fetched')
-})
-
-test('Slow decoder crossing freshness during a wait-on-stale poll keeps waiting for the replacement', async (t) => {
-  const redis = createFakeRedis(1000)
-  useRedisClock(t, redis)
-  const { data: dataKey, lock: lockKey } = createRedisKeys(DEFAULTS.prefix)
-  const slowCodec: SwrCodec<string> = {
-    encode: (v) => Buffer.from(v),
-    decode: (b) => {
-      const value = Buffer.from(b).toString()
-      if (value === 'almost-stale') redis.advanceTime(5) // crosses freshUntilMs=1003
-      return value
-    },
-  }
-  const write = (value: string, freshUntilMs: number) =>
-    redis.set(
-      dataKey('slow-poll'),
-      encodeEnvelope({ value, cachedAtMs: 0, freshUntilMs, expiresAtMs: 60_000 }, slowCodec),
-    )
-  await write('stale', 900)
-  await redis.set(lockKey('slow-poll'), 'other-owner', 'PX', 30_000)
-  const mgetBuffer = redis.mgetBuffer.bind(redis)
-  let polls = 0
-  redis.mgetBuffer = (async (...keys: string[]) => {
-    if (++polls === 1) {
-      await write('almost-stale', Date.now() + 3)
-    } else {
-      await write('replacement', Date.now() + 5000)
-      await redis.unlink(lockKey('slow-poll'))
-    }
-    return mgetBuffer(...keys)
-  }) as typeof redis.mgetBuffer
-  const cache = createSwrClient({ redis, mode: 'wait-on-stale', pollIntervalMs: 1 }).cache({
-    key: 'slow-poll',
-    codec: slowCodec,
-    fetch: async () => assert.fail('waiter must not fetch'),
-  })
-  assert.equal(await cache.get(), 'replacement')
-  assert.equal(polls, 2)
-})
-
-for (const path of ['fresh', 'cold-poll', 'stale-poll'] as const) {
-  test(`Custom codec decode failure propagates on ${path} without re-fetching`, async () => {
-    const redis = createFakeRedis()
-    const { data: dataKey, lock: lockKey } = createRedisKeys(DEFAULTS.prefix)
+for (const [path, fault, expectedEvents] of [
+  ['initial read', 'decode', []],
+  ['cold poll', 'decode', ['miss:wait', 'poll:error']],
+  ['stale poll', 'decode', ['hit', 'poll:error', 'error']],
+  ['stale poll', 'decompression', ['hit', 'poll:error', 'error']],
+  ['stale poll', 'abort in decoder', ['hit', 'poll:cancelled']],
+] as const) {
+  test(`${path} handles ${fault} without fetching`, { timeout: 2000 }, async (t) => {
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    const { data, lock } = createRedisKeys(DEFAULTS.prefix)
+    const key = 'corrupt'
     const failure = new Error('Cannot decode')
-    let fetches = 0
-    const customCodec: SwrCodec<string> = {
+    const cancellation = new Error('caller cancelled')
+    const controller = new AbortController()
+    const codec: SwrCodec<string> = {
       encode: (value) => Buffer.from(value),
       decode: (bytes) => {
         const value = Buffer.from(bytes).toString()
-        if (value === 'bad-payload') throw failure
-        return value
+        if (value !== 'unreadable') return value
+        if (fault === 'abort in decoder') controller.abort(cancellation)
+        throw failure
       },
     }
-    const cache = createSwrClient({ redis, memory: true }).cache({
-      key: 'corrupt',
-      codec: customCodec,
+    const broken = encodeEnvelope(
+      { value: 'unreadable', cachedAtMs: 1000, freshUntilMs: 2000, expiresAtMs: 5000 },
+      codec,
+    )
+    if (fault === 'decompression') broken[0] = 1
+    const matchesFailure = (error: unknown) =>
+      fault === 'decompression'
+        ? error instanceof Error && 'code' in error && error.code === 'Z_DATA_ERROR'
+        : error === failure
+
+    if (path === 'initial read') {
+      await redis.set(data(key), broken)
+    } else {
+      await redis.set(lock(key), 'other-owner', 'PX', 5000)
+      if (path === 'stale poll') {
+        await redis.set(
+          data(key),
+          encodeEnvelope(
+            { value: 'stale', cachedAtMs: 0, freshUntilMs: 500, expiresAtMs: 5000 },
+            codec,
+          ),
+        )
+      }
+      const mgetBuffer = redis.mgetBuffer.bind(redis)
+      redis.mgetBuffer = (async (...keys: string[]) => {
+        await redis.set(data(key), broken)
+        return mgetBuffer(...keys)
+      }) as typeof redis.mgetBuffer
+    }
+
+    let fetches = 0
+    const events: SwrEvent[] = []
+    const cache = createSwrClient({
+      redis,
+      memory: true,
       mode: 'wait-on-stale',
       pollIntervalMs: 1,
-      waitTimeout: 0.1,
-      fetch: async () => {
-        fetches++
-        return 'unexpected'
-      },
-    })
+      onEvent: (event) => events.push(event),
+    }).cache({ key, codec, fetch: async () => `fetched-${++fetches}` })
 
-    const now = Date.now()
-    const stored = encodeEnvelope(
-      {
-        value: 'bad-payload',
-        cachedAtMs: now,
-        freshUntilMs: now + 60_000,
-        expiresAtMs: now + 300_000,
-      },
-      customCodec,
-    )
-    const stale = encodeEnvelope(
-      {
-        value: 'stale',
-        cachedAtMs: now - 2000,
-        freshUntilMs: now - 1000,
-        expiresAtMs: now + 60_000,
-      },
-      customCodec,
-    )
-    await redis.set(dataKey('corrupt'), stored)
-    if (path !== 'fresh') {
-      await redis.set(lockKey('corrupt'), 'other-owner', 'PX', 5000)
+    const pending = cache.get(undefined, { signal: controller.signal })
+    if (fault === 'abort in decoder') {
+      await assert.rejects(pending, (err) => err === cancellation)
+    } else if (path === 'stale poll') {
+      assert.equal(await pending, 'stale')
+      const fallback = events.at(-1)
+      assert.ok(fallback?.type === 'error' && fallback.reason === 'stale_fallback')
+      assert.equal(fallback.severity, 'warn')
+      assert.equal(fallback.key, key)
+      assert.equal(fallback.stage, 'read')
+      assert.ok(matchesFailure(fallback.err))
+    } else {
+      await assert.rejects(pending, matchesFailure)
     }
 
-    const getBuffer = redis.getBuffer.bind(redis)
-    const mgetBuffer = redis.mgetBuffer.bind(redis)
-    let initialReads = 0
-    let pollReads = 0
-    redis.getBuffer = async (key: string) => {
-      initialReads++
-      if (path === 'cold-poll' && initialReads === 1) return null
-      if (path === 'stale-poll' && initialReads === 1) return stale
-      return getBuffer(key)
-    }
-    redis.mgetBuffer = (async (...keys: string[]) => {
-      pollReads++
-      return mgetBuffer(...keys)
-    }) as typeof redis.mgetBuffer
-
-    await assert.rejects(cache.get(), (error) => error === failure)
-    assert.equal(initialReads, 1)
-    assert.equal(pollReads, path === 'fresh' ? 0 : 1)
-    // A failed decode must leave the stored payload intact and never populate memory.
-    await assert.rejects(cache.get(), (error) => error === failure)
+    assert.deepEqual(
+      events.map((event) =>
+        event.type === 'poll'
+          ? `poll:${event.outcome}`
+          : event.type === 'miss'
+            ? `miss:${event.action}`
+            : event.type,
+      ),
+      expectedEvents,
+    )
+    // A subsequent initial read must still see the unreadable value in Redis.
+    await assert.rejects(cache.get(), matchesFailure)
     assert.equal(fetches, 0)
-    assert.deepEqual(await getBuffer(dataKey('corrupt')), stored)
+    assert.deepEqual(await redis.getBuffer(data(key)), broken)
   })
 }
 

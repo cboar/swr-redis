@@ -21,7 +21,7 @@ Durations are in seconds, except `pollIntervalMs`, which is in milliseconds.
 | `ttl` | Client, cache | Fresh lifetime in seconds. A cache can pass a callback. Default: `120`. |
 | `staleMultiplier` | Client, cache | Total Redis lifetime is `ttl * staleMultiplier`. Set `1` to disable the stale window. Default: `5`. |
 | `mode` | Client, cache | Stale revalidation mode: `'swr'`, `'swr-serverless'`, or `'wait-on-stale'`. Default: `'swr'`. |
-| `failureStrategy` | Client, cache | Behavior on Redis errors or cold-miss wait timeouts: `'availability'` or `'protect-source'`. Default: `'availability'`. |
+| `failureStrategy` | Client, cache | Behavior on Redis errors or wait timeouts when no stale value is available: `'availability'` or `'protect-source'`. Default: `'availability'`. |
 | `memory` | Client, cache, `get()` | Process-local LRU cache. Enable on the client with `true` or `{ maxEntries, maxTtl, clone }`; pass `false` on a cache or `get()` to opt out. Default: `false`. |
 | `signal` | `get()` | Cancels waiting and is forwarded to inline `fetch` calls. |
 | `name` | Cache | Low-cardinality label reported as `event.cache`. |
@@ -143,7 +143,8 @@ to tune it (`level` `0`–`9`).
 Compression settings can be changed safely without invalidating existing keys.
 Changing a `codec` cannot decode old entries, so bump a version segment in your
 key. Decode and decompression errors throw under both failure strategies without
-triggering a new fetch.
+triggering a new fetch, unless a waiting `'wait-on-stale'` caller can fall back
+to an unexpired stale value (reported via a `stale_fallback` event).
 
 ### Set ioredis command timeouts
 

@@ -45,7 +45,7 @@ const ERROR_SEVERITY: { [R in SwrErrorReason]: ErrorEventFor<R>['severity'] } = 
   fetch_cold_failure: 'error',
   fatal: 'error',
   timeout: 'error',
-  fetch_stale_fallback: 'warn',
+  stale_fallback: 'warn',
   lock_release_failure: 'warn',
   lock_renewal_failure: 'warn',
   lock_lost: 'warn',

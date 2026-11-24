@@ -154,6 +154,12 @@ if (evt.type === 'error') {
   expectType<SwrErrorReason>(evt.reason)
   if (evt.reason === 'redis_error' || evt.reason === 'redis_error_fallback')
     expectType<SwrNonEmptyKeys>(evt.keys)
+  if (evt.reason === 'stale_fallback') {
+    expectType<'warn'>(evt.severity)
+    expectType<'redis' | 'read' | 'refresh'>(evt.stage)
+    // @ts-expect-error Narrow the thrown value before reading error properties.
+    void evt.err.message
+  }
   if (evt.reason === 'timeout') expectType<number>(evt.err.elapsedMs + evt.durationMs)
   if (evt.reason === 'lock_lost') {
     expectType<number>(evt.durationMs)

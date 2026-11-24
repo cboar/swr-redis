@@ -1,8 +1,9 @@
 import test, { type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { SwrCacheImpl } from '../src/cache.ts'
-import { createSwrClient, SwrWriteBatch } from '../src/index.ts'
+import { createSwrClient, SwrRedisError, SwrWriteBatch } from '../src/index.ts'
 import { createRedisKeys } from '../src/keys.ts'
+import { registerLockCommands } from '../src/lock.ts'
 import { DEFAULTS } from '../src/options.ts'
 import type { SwrCodec, SwrEvent } from '../src/types.ts'
 import { createFakeRedis } from './fake-redis.ts'
@@ -298,34 +299,75 @@ test('Memory opt-out (cache): set and invalidate evict shared memory', async (t)
   assert.equal(reads.count, before + 1)
 })
 
-test('Memory: a failed set, invalidate or invalidateKeys evicts, under both failure strategies', async (t) => {
+test('Failed writes evict memory and report the affected keys under both failure strategies', async (t) => {
   for (const failureStrategy of ['availability', 'protect-source'] as const) {
     for (const operation of ['set', 'invalidate', 'invalidateKeys'] as const) {
       const label = `${operation} under ${failureStrategy}`
-      const { redis, cache, internals } = memoryHarness(
-        t,
-        { key: 'failed-write', fetch: async () => 'old' },
-        { failureStrategy },
-      )
-      await cache.get()
-      const reads = countReads(redis)
-      const down = async () => {
-        throw new Error('Redis unavailable')
+      const { redis, reads } = fakeClient(t)
+      const events: SwrEvent[] = []
+      const swr = createSwrClient({
+        redis,
+        memory: true,
+        failureStrategy,
+        onEvent: (event) => events.push(event),
+      })
+      const cache = swr.cache({
+        name: 'writer',
+        key: (key: string) => key,
+        fetch: async () => 'unexpected',
+      })
+      const keys = operation === 'invalidateKeys' ? ['a', 'b', 'c'] : ['a']
+      for (const key of keys) {
+        await cache.set(key, `old-${key}`)
+        assert.equal(await cache.get(key), `old-${key}`, label)
       }
-      const commands = redis as unknown as Record<string, typeof down>
-      commands.swrSetAndClearLock = down
-      redis.unlink = down
+      assert.equal(reads.count, 0, label)
+      events.length = 0
+
+      const failure = new Error('Redis unavailable')
+      const down = async () => {
+        throw failure
+      }
+      if (operation === 'set') registerLockCommands(redis).swrSetAndClearLock = down
+      else redis.unlink = down
       const run =
         operation === 'set'
-          ? cache.set(undefined, 'new')
+          ? cache.set('a', 'new')
           : operation === 'invalidate'
-            ? cache.invalidate()
-            : internals.invalidate([cache.key()], failureStrategy)
-      if (failureStrategy === 'protect-source') {
-        await assert.rejects(run, { name: 'SwrRedisError' }, label)
+            ? cache.invalidate('a')
+            : swr.invalidateKeys(...keys)
+      const protectsSource = failureStrategy === 'protect-source'
+      if (protectsSource) {
+        await assert.rejects(
+          run,
+          (error: unknown) => {
+            assert.ok(error instanceof SwrRedisError)
+            assert.equal(error.cause, failure)
+            assert.equal(error.key, 'a')
+            assert.deepEqual(error.keys, keys)
+            if (operation === 'invalidateKeys') assert.match(error.message, /3 keys/)
+            return true
+          },
+          label,
+        )
       } else await run
-      assert.equal(await cache.get(), 'old', label)
-      assert.equal(reads.count, 1, label)
+      assert.deepEqual(
+        events,
+        [
+          {
+            type: 'error',
+            reason: protectsSource ? 'redis_error' : 'redis_error_fallback',
+            severity: protectsSource ? 'error' : 'warn',
+            ...(operation === 'invalidateKeys' ? {} : { cache: 'writer' }),
+            key: 'a',
+            keys,
+            err: failure,
+          },
+        ],
+        label,
+      )
+      for (const key of keys) assert.equal(await cache.get(key), `old-${key}`, label)
+      assert.equal(reads.count, keys.length, label)
     }
   }
 })
@@ -430,7 +472,7 @@ test('Memory clone: a value structuredClone rejects fails like an encode error, 
       assert.deepEqual(await cache.get(), { tag: 'old' }, path)
     } else if (path === 'stale fetch') {
       assert.deepEqual(await cache.get(), { tag: 'old' }, path)
-      assert.ok(events.some((e) => e.type === 'error' && e.reason === 'fetch_stale_fallback'))
+      assert.ok(events.some((e) => e.type === 'error' && e.reason === 'stale_fallback'))
     } else {
       await assert.rejects(cache.get(), { name: 'DataCloneError' }, path)
       assert.ok(events.some((e) => e.type === 'error' && e.reason === 'fetch_cold_failure'))
@@ -462,7 +504,7 @@ test('Memory clone: a value structuredClone rejects fails like an encode error, 
   }
 })
 
-test('Memory clone: a populate clone error propagates on the initial read and on a poll', async (t) => {
+test('Memory clone: a populate clone error propagates on the initial read and on a cold poll', async (t) => {
   for (const path of ['initial read', 'cold poll'] as const) {
     let value: Record<string, unknown> = { fn: () => {} }
     const codec = { encode: () => new Uint8Array([1]), decode: () => value }
@@ -491,6 +533,48 @@ test('Memory clone: a populate clone error propagates on the initial read and on
     value = { ok: true }
     assert.deepEqual(await cache.get(), { ok: true }, path)
   }
+})
+
+test('Memory clone: a populate clone error during a stale wait serves the stale snapshot', async (t) => {
+  const events: SwrEvent[] = []
+  let fetches = 0
+  const text: SwrCodec<string> = {
+    encode: (value) => Buffer.from(value),
+    decode: (bytes) => Buffer.from(bytes).toString(),
+  }
+  // The replacement decodes to a value structuredClone rejects.
+  const codec: SwrCodec<Record<string, unknown>> = {
+    encode: () => assert.fail('must not encode'),
+    decode: (bytes) => (text.decode(bytes) === 'stale' ? { tag: 'stale' } : { fn: () => {} }),
+  }
+  const { redis, cache } = memoryHarness<Record<string, unknown>>(
+    t,
+    {
+      key: 'stale-clone',
+      codec,
+      fetch: async () => ({ fetched: ++fetches }),
+    },
+    { mode: 'wait-on-stale', failureStrategy: 'protect-source', onEvent: (e) => events.push(e) },
+    createLruMemory({ clone: true }),
+  )
+  await redis.set(
+    toDataKey('stale-clone'),
+    encodeEnvelope({ value: 'stale', cachedAtMs: 0, freshUntilMs: 500, expiresAtMs: 10_000 }, text),
+  )
+  await redis.set(toLockKey('stale-clone'), 'other-owner', 'PX', 5000)
+  const mgetBuffer = redis.mgetBuffer.bind(redis)
+  redis.mgetBuffer = (async (...keys: string[]) => {
+    redis.mgetBuffer = mgetBuffer
+    await redis.set(toDataKey('stale-clone'), stored('fresh', 5000, text))
+    return mgetBuffer(...keys)
+  }) as typeof redis.mgetBuffer
+
+  assert.deepEqual(await cache.get(), { tag: 'stale' })
+  assert.equal(fetches, 0)
+  const fallback = events.find((e) => e.type === 'error')
+  assert.ok(fallback?.type === 'error' && fallback.reason === 'stale_fallback')
+  assert.equal(fallback.stage, 'read')
+  assert.equal((fallback.err as Error).name, 'DataCloneError')
 })
 
 test('Memory clone: set() stores a clone, so mutating the input afterwards does not reach memory', async (t) => {
