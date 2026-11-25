@@ -30,7 +30,7 @@ for (const releaseFails of [false, true]) {
       const releaseFailure = new Error('Redis connection lost during release')
       const events: SwrEvent[] = []
       if (releaseFails) {
-        registerLockCommands(redis).swrReleaseLock = async () => {
+        registerLockCommands(redis).swrCooldownLock = async () => {
           throw releaseFailure
         }
       }
@@ -41,7 +41,7 @@ for (const releaseFails of [false, true]) {
         },
       })
       await assert.rejects(cache.get(), (error) => error === failure)
-      if (!releaseFails) assert.equal(await redis.get(toLockKey('cold-fail')), null)
+      if (!releaseFails) assert.equal(await redis.get(toLockKey('cold-fail')), 'cooldown')
       assert.deepEqual(
         events.filter((event) => event.type === 'error'),
         [
@@ -77,7 +77,7 @@ test(
     useRedisClock(t, redis)
     const cmds = registerLockCommands(redis)
     let calls = 0
-    const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache({
+    const cache = createSwrClient({ redis, runtime: 'serverless' }).cache({
       key: 'stale-release',
       ttl: 5,
       fetch: async () => {
@@ -129,7 +129,7 @@ test('Inline refresh propagates the fetch error when the snapshot expires', asyn
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const failure = new Error('upstream unavailable')
-  const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache<string>({
+  const cache = createSwrClient({ redis, runtime: 'serverless' }).cache<string>({
     key: 'inline-expiry',
     ttl: 1,
     staleMultiplier: 2,
@@ -149,7 +149,8 @@ for (const stage of ['acquire', 'poll'] as const) {
     useRedisClock(t, redis)
     const cache = createSwrClient({
       redis,
-      mode: 'wait-on-stale',
+      runtime: 'serverless',
+      staleWait: 10,
       failureStrategy: 'protect-source',
       pollIntervalMs: 1,
     }).cache({ key: 'redis-expiry', ttl: 1, staleMultiplier: 2, fetch: async () => 'fresh' })
@@ -261,7 +262,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
         const cache = createSwrClient({
           redis,
           failureStrategy,
-          mode: polling ? 'wait-on-stale' : 'swr',
+          staleWait: polling ? 10 : 0,
           pollIntervalMs: 1,
           onEvent: (e) => events.push(e),
         }).cache<string | undefined>({
@@ -402,10 +403,10 @@ test('flush handles a rejected background refresh without an unhandled cleanup p
   redis.advanceTime(3000)
   assert.equal(await cache.get(), 'original')
   assert.ok(tracked)
-  await assert.rejects(tracked, (err) => err === failure)
+  await tracked // a refresh reports its failures and never rejects
   await swr.flush()
   await new Promise<void>((resolve) => setImmediate(resolve))
-  assert.equal(await redis.get(toLockKey('bg-reject-inflight')), null)
+  assert.equal(await redis.get(toLockKey('bg-reject-inflight')), 'cooldown')
 })
 
 test(
@@ -429,7 +430,7 @@ test(
 
 for (const phase of ['cold', 'stale'] as const) {
   test(
-    `AbortSignal: cooperative ${phase} inline fetch releases its lock`,
+    `AbortSignal: a caller abort detaches from a ${phase} inline fetch without aborting it`,
     { timeout: 2000 },
     async (t) => {
       const redis = createFakeRedis(1000)
@@ -439,7 +440,7 @@ for (const phase of ['cold', 'stale'] as const) {
       const events: SwrEvent[] = []
       const cache = createSwrClient({
         redis,
-        mode: 'swr-serverless',
+        runtime: 'serverless',
         onEvent: (event) => events.push(event),
       }).cache({
         key: 'inline-abort',
@@ -463,7 +464,8 @@ for (const phase of ['cold', 'stale'] as const) {
       await entered.promise
       controller.abort(reason)
       await assert.rejects(pending, (error) => error === reason)
-      assert.equal(await redis.get(toLockKey('inline-abort')), null)
+      // The shared fetch keeps running and holding the lock.
+      assert.ok(await redis.get(toLockKey('inline-abort')))
       assert.equal(
         events.some((event) => event.type === 'error'),
         false,
@@ -481,7 +483,8 @@ for (const phase of ['cold', 'stale'] as const) {
       const events: SwrEvent[] = []
       const cache = createSwrClient({
         redis,
-        mode: 'wait-on-stale',
+        runtime: 'serverless',
+        staleWait: 10,
         pollIntervalMs: 1,
         onEvent: (event) => {
           events.push(event)
@@ -537,7 +540,8 @@ for (const phase of ['cold', 'stale'] as const) {
         const cache = createSwrClient({
           redis,
           memory: true,
-          mode: 'wait-on-stale',
+          runtime: 'serverless',
+          staleWait: 10,
           failureStrategy: 'availability',
           pollIntervalMs: 1,
         }).cache<string>({
@@ -758,7 +762,7 @@ for (const [phase, acquireOutcome] of [
       let fetches = 0
       const cache = createSwrClient({
         redis,
-        mode: 'swr',
+        runtime: 'server',
         onEvent: (e) => events.push(e),
         waitUntil: () => {
           waitUntilCalls++

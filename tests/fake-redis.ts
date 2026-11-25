@@ -2,6 +2,8 @@ import type { Redis } from 'ioredis'
 import {
   ACQUIRE_LOCK_SCRIPT,
   COMMIT_AND_RELEASE_SCRIPT,
+  COOLDOWN_LOCK_SCRIPT,
+  COOLDOWN_MARKER,
   EXTEND_LOCK_SCRIPT,
   RELEASE_LOCK_SCRIPT,
   SET_AND_CLEAR_LOCK_SCRIPT,
@@ -156,9 +158,18 @@ export class FakeRedis {
       case ACQUIRE_LOCK_SCRIPT: {
         const lockKey = keys[0]!
         const token = String(argv[0])
-        const current = this.cleanExpired(lockKey)
-        if (current && current.value.toString('utf-8') !== token) return '0'
+        const owner = this.cleanExpired(lockKey)?.value.toString('utf-8')
+        if (owner === COOLDOWN_MARKER) return 'cooldown'
+        if (owner !== undefined && owner !== token) return 'busy'
         this.storeValue(lockKey, token, 'PX', argv[1])
+        return 'acquired'
+      }
+
+      case COOLDOWN_LOCK_SCRIPT: {
+        const lockKey = keys[0]!
+        const current = this.cleanExpired(lockKey)
+        if (!current || current.value.toString('utf-8') !== String(argv[0])) return '0'
+        this.storeValue(lockKey, COOLDOWN_MARKER, 'PX', argv[1])
         return '1'
       }
 

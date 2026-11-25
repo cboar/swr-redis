@@ -52,7 +52,7 @@ test(
       redis,
       ttl: 10,
       pollIntervalMs: 5,
-      waitTimeout: 1,
+      fetchTimeout: 1,
       onEvent: (e) => {
         if (e.type === 'miss' && e.action === 'wait') waiting.resolve()
       },
@@ -112,7 +112,8 @@ for (const mode of ['swr', 'swr-serverless', 'wait-on-stale'] as const) {
         memory: true,
         ttl: 1,
         staleMultiplier: 10,
-        mode,
+        runtime: mode === 'swr' ? 'server' : 'serverless',
+        staleWait: mode === 'wait-on-stale' ? 10 : 0,
         pollIntervalMs: 5,
         onEvent: (event) => {
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiterStarted()

@@ -22,7 +22,6 @@ test(
       ttl: 5,
       staleMultiplier: 6,
       pollIntervalMs: 15,
-      waitTimeout: 5,
       onEvent: (event: import('../../src/types.ts').SwrEvent) => {
         if (event.type === 'miss' && event.action === 'wait' && ++waiters === 49)
           allWaiting.resolve()

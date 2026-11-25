@@ -185,7 +185,7 @@ test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional dead
   assert.ok(await redis.getBuffer(toDataKey('hard-cutoff')))
   // A stale hit would return null in 'swr' mode; a cold miss surfaces the fetch failure.
   await assert.rejects(cache.get(), (error) => error === failure)
-  assert.equal(await redis.get(toLockKey('hard-cutoff')), null)
+  assert.equal(await redis.get(toLockKey('hard-cutoff')), 'cooldown')
 })
 
 for (const phase of ['cold', 'stale', 'set'] as const) {
@@ -206,7 +206,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
       const cache = createSwrClient({
         redis,
         memory: true,
-        mode: 'swr-serverless',
+        runtime: 'serverless',
       }).cache({
         key: 'invalid-ttl',
         ttl: () => (invalidResult ? invalid : 1),
@@ -222,7 +222,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
         `ttl=${String(invalid)}`,
       )
       assert.deepEqual(await redis.getBuffer(toDataKey('invalid-ttl')), before)
-      assert.equal(await redis.get(toLockKey('invalid-ttl')), null)
+      assert.equal(await redis.get(toLockKey('invalid-ttl')), phase === 'set' ? null : 'cooldown')
       if (phase === 'set') {
         assert.equal(await cache.get(), 'existing')
         assert.equal(await cache.get(undefined, { memory: false }), 'existing')
@@ -238,7 +238,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
     const cache = createSwrClient({
       redis,
       memory: true,
-      mode: 'swr-serverless',
+      runtime: 'serverless',
     }).cache({
       key: 'throw-ttl',
       ttl: () => {
@@ -258,7 +258,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
         (error) => error === failure,
       )
     assert.deepEqual(await redis.getBuffer(toDataKey('throw-ttl')), before)
-    assert.equal(await redis.get(toLockKey('throw-ttl')), null)
+    assert.equal(await redis.get(toLockKey('throw-ttl')), phase === 'set' ? null : 'cooldown')
     if (phase === 'set') assert.equal(await cache.get(), 'existing')
   })
 }

@@ -40,23 +40,23 @@ const INVALID_OPTION_CASES: InvalidOptionCase[] = [
     options: { lockTtl },
     expectedFragment: 'lockTtl',
   })),
-  ...([0, -1, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER / 1000 + 1] as const).map(
-    (maxLockTtl) => ({
-      label: `maxLockTtl=${String(maxLockTtl)}`,
-      options: { maxLockTtl },
-      expectedFragment: 'maxLockTtl',
+  ...([0, -1, NaN, Infinity, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map(
+    (fetchTimeout) => ({
+      label: `fetchTimeout=${String(fetchTimeout)}`,
+      options: { fetchTimeout },
+      expectedFragment: 'fetchTimeout',
     }),
   ),
-  {
-    label: 'same-layer maxLockTtl < lockTtl',
-    options: { lockTtl: 10, maxLockTtl: 5 },
-    expectedFragment: 'maxLockTtl',
-  },
-  ...([0, -1, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER / 1000 + 1] as const).map(
-    (waitTimeout) => ({
-      label: `waitTimeout=${String(waitTimeout)}`,
-      options: { waitTimeout },
-      expectedFragment: 'waitTimeout',
+  ...([-1, NaN, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map((staleWait) => ({
+    label: `staleWait=${String(staleWait)}`,
+    options: { staleWait },
+    expectedFragment: 'staleWait',
+  })),
+  ...([-1, NaN, Infinity, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map(
+    (failureCooldown) => ({
+      label: `failureCooldown=${String(failureCooldown)}`,
+      options: { failureCooldown },
+      expectedFragment: 'failureCooldown',
     }),
   ),
   ...(
@@ -119,56 +119,6 @@ test('Options validation: rejects empty prefixes, cache names, and keys', async 
   await redis.unlink(keys.data('a'))
   await assert.rejects(withMemory.invalidateKeys('a', ''), rejects('key'))
   assert.equal(await a.get(), 'kept')
-})
-
-test('Options validation: enforces merged cross-layer maxLockTtl >= lockTtl in both directions', () => {
-  const redis = createFakeRedis()
-
-  const clientWithHighLockTtl = createSwrClient({ redis, lockTtl: 10 })
-  assert.throws(
-    () =>
-      clientWithHighLockTtl.cache({
-        key: 'cross-1',
-        maxLockTtl: 5,
-        fetch: async () => 'v',
-      }),
-    (err: unknown) => err instanceof SwrValidationError && err.message.includes('maxLockTtl'),
-  )
-  clientWithHighLockTtl.cache({
-    key: 'cross-1-eq',
-    maxLockTtl: 10,
-    fetch: async () => 'v',
-  })
-
-  const clientWithLowMaxLockTtl = createSwrClient({ redis, maxLockTtl: 5 })
-  assert.throws(
-    () =>
-      clientWithLowMaxLockTtl.cache({
-        key: 'cross-2',
-        lockTtl: 10,
-        fetch: async () => 'v',
-      }),
-    (err: unknown) => err instanceof SwrValidationError && err.message.includes('maxLockTtl'),
-  )
-  clientWithLowMaxLockTtl.cache({
-    key: 'cross-2-eq',
-    lockTtl: 5,
-    fetch: async () => 'v',
-  })
-
-  // A client maxLockTtl below the default lockTtl stays valid for caches that lower lockTtl.
-  createSwrClient({ redis, maxLockTtl: 2 }).cache({
-    key: 'cross-3',
-    lockTtl: 2,
-    fetch: async () => 'v',
-  })
-
-  // lockTtl exceeding default ceiling (30s) without explicit maxLockTtl uses Math.max(30, lockTtl)
-  const clientWithLongLockTtl = createSwrClient({ redis, lockTtl: 45 })
-  clientWithLongLockTtl.cache({
-    key: 'cross-default-max',
-    fetch: async () => 'v',
-  })
 })
 
 test('Options validation: enforces merged cross-layer resolved Redis TTL ceiling', () => {
@@ -262,8 +212,9 @@ test('Options validation: accepts valid boundary values on client and cache over
       ttl: 0.1,
       staleMultiplier: 1,
       lockTtl: 0.05,
-      maxLockTtl: 0.05,
-      waitTimeout: 0.05,
+      fetchTimeout: 0.05,
+      staleWait: 0,
+      failureCooldown: 0,
       pollIntervalMs: 1,
       compression: false,
     },
@@ -283,8 +234,9 @@ test('Options validation: accepts valid boundary values on client and cache over
       compression: { level: 9, minBytes: Number.MAX_SAFE_INTEGER },
       pollIntervalMs: MAX_POLL_INTERVAL_MS,
       lockTtl: MAX_TIMER_MS / 1000,
-      maxLockTtl: Math.floor(Number.MAX_SAFE_INTEGER / 1000),
-      waitTimeout: Math.floor(Number.MAX_SAFE_INTEGER / 1000),
+      fetchTimeout: MAX_TIMER_MS / 1000,
+      staleWait: Infinity,
+      failureCooldown: MAX_TIMER_MS / 1000,
     },
   ]
 

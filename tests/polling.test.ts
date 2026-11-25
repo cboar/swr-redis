@@ -2,7 +2,7 @@ import test from 'node:test'
 import { getEventListeners } from 'node:events'
 import assert from 'node:assert/strict'
 import { setImmediate } from 'node:timers/promises'
-import { pollDelayMs } from '../src/cache.ts'
+import { pollDelayMs } from '../src/timing.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createSwrClient, SwrTimeoutError, type SwrEvent } from '../src/index.ts'
@@ -150,7 +150,6 @@ test(
     const cache = createSwrClient({
       redis,
       pollIntervalMs: 10,
-      waitTimeout: 0.03,
       failureStrategy: 'protect-source',
       onEvent: (event) => {
         events.push(event)
@@ -201,7 +200,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
       const cache = createSwrClient({
         redis,
         failureStrategy,
-        waitTimeout: 0.03,
+        fetchTimeout: 0.03,
         pollIntervalMs: 10,
         onEvent: (event) => {
           events.push(event)
@@ -216,29 +215,26 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
         },
       })
       const pending = cache.get()
-      const result =
-        failureStrategy === 'protect-source'
-          ? assert.rejects(
-              pending,
-              (error) => error instanceof SwrTimeoutError && error.key === 'timeout',
-            )
-          : pending.then((value) => assert.equal(value, 'direct'))
+      // Waiters never fall back to the source under either strategy.
+      const result = assert.rejects(
+        pending,
+        (error) =>
+          error instanceof SwrTimeoutError && error.key === 'timeout' && error.phase === 'wait',
+      )
       await waiting.promise
       await tick(t, redis, 30)
       await result
-      assert.equal(fetches, failureStrategy === 'availability' ? 1 : 0)
+      assert.equal(fetches, 0)
       assert.equal(pollSnapshots, 1)
       assert.deepEqual(events.slice(0, 2), [
         { type: 'miss', key: 'timeout', action: 'wait' },
         { type: 'poll', key: 'timeout', outcome: 'timeout', attempts: 1, durationMs: 30 },
       ])
-      if (failureStrategy === 'protect-source') {
-        assert.equal(events.length, 3)
-        const error = events[2]
-        assert.ok(error?.type === 'error' && error.reason === 'timeout')
-        assert.equal(error.severity, 'error')
-        assert.equal(error.durationMs, 30)
-      } else assert.equal(events.length, 2)
+      assert.equal(events.length, 3)
+      const error = events[2]
+      assert.ok(error?.type === 'error' && error.reason === 'timeout')
+      assert.equal(error.severity, 'error')
+      assert.equal(error.durationMs, 30)
     },
   )
 }
@@ -370,7 +366,8 @@ for (const { name, freshUntilMs, expected } of [
     }) as typeof redis.mgetBuffer
     const cache = createSwrClient({
       redis,
-      mode: 'wait-on-stale',
+      runtime: 'serverless',
+      staleWait: 10,
       pollIntervalMs: 1,
     }).cache({
       key,
@@ -425,9 +422,9 @@ for (const scenario of ['timeout', 'unlocked'] as const) {
 
       const cache = createSwrClient({
         redis,
-        mode: 'wait-on-stale',
+        runtime: 'serverless',
+        staleWait: 0.03,
         failureStrategy: scenario === 'timeout' ? 'protect-source' : 'availability',
-        waitTimeout: 0.03,
         pollIntervalMs: scenario === 'timeout' ? 10 : 1,
         onEvent: (event) => {
           events.push(event)
@@ -466,7 +463,6 @@ test(
     const cache = createSwrClient({
       redis,
       pollIntervalMs: 100,
-      waitTimeout: 10,
       onEvent: (event) => {
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },

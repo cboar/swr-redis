@@ -462,7 +462,7 @@ test('createSwrPaginatedCache: a secondary clone failure fails the batch before 
   await cache.set(1, { docs: [{ id: 99 }], pageIndex: 1, pageSize: 1 })
 
   await assert.rejects(() => cache.get(0), { name: 'DataCloneError' })
-  assert.equal(await redis.get(lockKey('clone:p0')), null)
+  assert.equal(await redis.get(lockKey('clone:p0')), 'cooldown')
   for (const page of [0, 2]) assert.equal(await redis.getBuffer(dataKey(`clone:p${page}`)), null)
   let reads = 0
   const getBuffer = redis.getBuffer.bind(redis)
@@ -494,7 +494,7 @@ test('createSwrPaginatedCache: a throwing key callback for a secondary page fail
     () => keyFailure.get(0),
     (err) => err === keyError,
   )
-  assert.equal(await redis.get(lockKey('key-failure:p0')), null)
+  assert.equal(await redis.get(lockKey('key-failure:p0')), 'cooldown')
   assert.equal(await redis.getBuffer(dataKey('key-failure:p0')), null)
   assert.equal(await redis.getBuffer(dataKey('key-failure:p2')), null)
 })

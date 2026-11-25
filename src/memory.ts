@@ -6,7 +6,7 @@ export interface ReadGuard {
   version: number
 }
 
-/** A write to settle into memory; without `envelope` the key is only evicted. */
+// Without envelope, settling only evicts the key.
 export interface MemoryWrite {
   key: string
   envelope?: Envelope<unknown>
@@ -87,8 +87,8 @@ export class LruMemory implements MemoryStore {
       return
     }
     const value = structuredClone(envelope.value)
-    // structuredClone runs property getters. A getter that calls set() or invalidate() can finish
-    // that write synchronously (its Redis call throws), so check the version again.
+    // structuredClone runs getters; a re-entrant set() or invalidate() that throws synchronously
+    // still settles its version, so re-check before storing.
     if (this.versions.current(guard.key) !== guard.version) return
     this.store(guard.key, { value, timing: envelope.timing })
   }
@@ -120,7 +120,7 @@ export class LruMemory implements MemoryStore {
   }
 }
 
-/** Counters bumped by every finished write; a key is tracked only while an operation on it runs. */
+// Per-key write counters; entries exist only while an operation on the key is active.
 class KeyVersions {
   private readonly versions = new Map<string, { version: number; refs: number }>()
 
@@ -142,7 +142,6 @@ class KeyVersions {
     return this.versions.get(key)!.version
   }
 
-  /** Finishes a write; returns false if another write finished since `version` was taken. */
   endWrite(key: string, version: number): boolean {
     const v = this.versions.get(key)!
     const uncontested = v.version === version

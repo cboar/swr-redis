@@ -12,13 +12,14 @@ import { createRedisKeys } from '../src/keys.ts'
 import { registerLockCommands } from '../src/lock.ts'
 import type { LruMemory, PendingWrites, ReadGuard } from '../src/memory.ts'
 import { DEFAULTS, resolveClientOptions } from '../src/options.ts'
-import type { SwrMode } from '../src/types.ts'
 import { SwrWriteBatch } from '../src/wrappers.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { decodeEnvelope, encodeEnvelope } from './helpers/envelope.ts'
 import { createLruMemory } from './helpers/memory-harness.ts'
 
-const MODES: readonly SwrMode[] = ['swr', 'swr-serverless', 'wait-on-stale']
+// The v1 stale modes, expressed with runtime and staleWait.
+type Mode = 'swr' | 'swr-serverless' | 'wait-on-stale'
+const MODES: readonly Mode[] = ['swr', 'swr-serverless', 'wait-on-stale']
 const ORDERS = ['fifo', 'reordered'] as const
 const FAULTS = ['lost-replies', 'resends-and-set-failures'] as const
 const RUNS = Number(process.env.MEMORY_MODEL_RUNS ?? 200)
@@ -98,7 +99,7 @@ function faultFor(faults: Faults, name: string, r: number): Fault {
 async function runOnce(
   t: TestContext,
   seed: number,
-  mode: SwrMode,
+  mode: Mode,
   order: Order,
   faults: Faults,
   stats: Stats,
@@ -218,10 +219,11 @@ async function runOnce(
       options: resolveClientOptions({
         ttl: 1,
         lockTtl: 1,
-        maxLockTtl: 2,
-        waitTimeout: 2,
+        // Long enough that the schedule's mock-timer ticks never time out a fetch or a waiter.
+        fetchTimeout: 3600,
         pollIntervalMs: 1,
-        mode,
+        runtime: mode === 'swr' ? 'server' : 'serverless',
+        staleWait: mode === 'wait-on-stale' ? 2 : 0,
         memory: true,
       }),
       emit: createEventEmitter((event) => {

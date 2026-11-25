@@ -9,8 +9,9 @@ export function interceptAcquire(
 ): void {
   const commands = registerLockCommands(redis)
   const run = commands.swrAcquireLock.bind(redis)
-  const acquire: Acquire = async (...args) => (await run(...args)) === '1'
-  commands.swrAcquireLock = async (...args) => ((await intercept(acquire, ...args)) ? '1' : '0')
+  const acquire: Acquire = async (...args) => (await run(...args)) === 'acquired'
+  commands.swrAcquireLock = async (...args) =>
+    (await intercept(acquire, ...args)) ? 'acquired' : 'busy'
 }
 
 export function failAcquire(redis: Redis, error = new Error('acquire failed')): void {

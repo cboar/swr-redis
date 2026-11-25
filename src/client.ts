@@ -91,7 +91,8 @@ export function createClientInternals(init: ClientInternalsInit): ClientInternal
         await redis.unlink(keys.flatMap((k) => [redisKeys.data(k), redisKeys.lock(k)]))
       } catch (err) {
         memory.settle(pending, 'evict')
-        reportRedisError(keys, err, strategy, emit)
+        const redisError = reportRedisError(keys, err, strategy, emit)
+        if (redisError) throw redisError
         return
       }
       memory.settle(pending, 'evict')

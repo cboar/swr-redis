@@ -20,11 +20,11 @@ export function lockContract(
       const alpha = new RedisLock(redis, 'lock:user:123')
       const beta = new RedisLock(redis, 'lock:user:123')
 
-      assert.equal(await alpha.acquire(5000), true)
+      assert.equal(await alpha.acquire(5000), 'acquired')
       assert.equal(await redis.get(alpha.key), alpha.token)
       await assertTtl(redis, alpha.key, 5000)
 
-      assert.equal(await beta.acquire(5000), false)
+      assert.equal(await beta.acquire(5000), 'busy')
       assert.equal(await redis.get(alpha.key), alpha.token)
     },
   )
@@ -38,12 +38,12 @@ export function lockContract(
       const owner = new RedisLock(redis, 'lock:replay:1')
       const other = new RedisLock(redis, 'lock:replay:1')
 
-      assert.equal(await owner.acquire(2000), true)
-      assert.equal(await owner.acquire(5000), true)
+      assert.equal(await owner.acquire(2000), 'acquired')
+      assert.equal(await owner.acquire(5000), 'acquired')
       assert.equal(await redis.get(owner.key), owner.token)
       await assertTtl(redis, owner.key, 5000)
 
-      assert.equal(await other.acquire(5000), false)
+      assert.equal(await other.acquire(5000), 'busy')
       assert.equal(await redis.get(owner.key), owner.token)
     },
   )
@@ -54,7 +54,7 @@ export function lockContract(
     const redis = registerLockCommands(raw)
     const lock = new RedisLock(redis, 'lock:dataset:1')
 
-    assert.equal(await lock.acquire(10000), true)
+    assert.equal(await lock.acquire(10000), 'acquired')
 
     const buf = Buffer.from('payload-a')
     const result = await lock.commit([{ dataKey: 'dataset:1:a', buffer: buf, ttlSeconds: 120 }])
@@ -77,7 +77,7 @@ export function lockContract(
       const lock = new RedisLock(redis, 'lock:dataset:warm')
 
       await redis.set('dataset:warm:existing', Buffer.from('old'), 'EX', 300)
-      assert.equal(await lock.acquire(10000), true)
+      assert.equal(await lock.acquire(10000), 'acquired')
 
       const primaryBuf = Buffer.from('primary-payload')
       const replacementBuf = Buffer.from('replacement-payload')
@@ -134,7 +134,7 @@ export function lockContract(
       const redis = registerLockCommands(raw)
       const lock = new RedisLock(redis, 'lock:dataset:script-err')
 
-      assert.equal(await lock.acquire(10000), true)
+      assert.equal(await lock.acquire(10000), 'acquired')
 
       // Omit the second secondary's EX so Redis errors mid-script after writing primary and secondary 0.
       await assert.rejects(() =>

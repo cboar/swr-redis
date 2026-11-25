@@ -182,7 +182,7 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
       err instanceof SwrValidationError &&
       err.message.includes('Duplicate cache write key: "dup:p1"'),
   )
-  assert.equal(await redis.get(toLockKey('dup:p1')), null)
+  assert.equal(await redis.get(toLockKey('dup:p1')), 'cooldown')
   assert.equal(await redis.getBuffer(toDataKey('dup:p1')), null)
 
   // 2. Duplicate secondary keys
@@ -203,7 +203,7 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
       err instanceof SwrValidationError &&
       err.message.includes('Duplicate cache write key: "norm:alpha"'),
   )
-  assert.equal(await redis.get(toLockKey('norm:root')), null)
+  assert.equal(await redis.get(toLockKey('norm:root')), 'cooldown')
   assert.equal(await redis.getBuffer(toDataKey('norm:root')), null)
   assert.equal(await redis.getBuffer(toDataKey('norm:alpha')), null)
 
@@ -217,7 +217,7 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
       }),
   })
   await assert.rejects(() => emptySec.get('valid-primary'), SwrValidationError)
-  assert.equal(await redis.get(toLockKey('valid-primary')), null)
+  assert.equal(await redis.get(toLockKey('valid-primary')), 'cooldown')
   assert.equal(await redis.getBuffer(toDataKey('valid-primary')), null)
 })
 
@@ -253,7 +253,7 @@ test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/mem
       () => badBatchTtl.get('p'),
       (err: unknown) => err instanceof SwrValidationError && err.message.includes('ttl'),
     )
-    assert.equal(await redis.get(toLockKey('bad-batch:p')), null)
+    assert.equal(await redis.get(toLockKey('bad-batch:p')), 'cooldown')
     assert.equal(await redis.getBuffer(toDataKey('bad-batch:p')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-batch:sec')), null)
 
@@ -273,7 +273,7 @@ test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/mem
       () => badSecTtl.get('p'),
       (err: unknown) => err instanceof SwrValidationError && err.message.includes('ttl'),
     )
-    assert.equal(await redis.get(toLockKey('bad-sec:p')), null)
+    assert.equal(await redis.get(toLockKey('bad-sec:p')), 'cooldown')
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:p')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:valid-before')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:invalid')), null)
@@ -316,7 +316,7 @@ test('SwrWriteBatch: encoding error on secondary fails preparation before Redis 
     (err) => err === encodeError,
   )
   assert.equal(commitCalls, 0)
-  assert.equal(await redis.get(toLockKey('enc:primary')), null)
+  assert.equal(await redis.get(toLockKey('enc:primary')), 'cooldown')
   assert.equal(await redis.getBuffer(toDataKey('enc:primary')), null)
   assert.equal(await redis.getBuffer(toDataKey('enc:good')), null)
 })
@@ -328,7 +328,6 @@ test('SwrWriteBatch: lock loss aborts primary and secondary writes in Redis and 
     redis,
     memory: true,
     lockTtl: 1,
-    maxLockTtl: 1,
   })
 
   const cache = swr.cache({

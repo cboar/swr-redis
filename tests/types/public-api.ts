@@ -142,7 +142,7 @@ swr.cache({ key: 'k', ttl: ({ value }: { value: number }) => value, fetch: async
 // Exported shared option and TTL types describe the options.
 const shared: SwrSharedOptions = {
   ttl: 60,
-  mode: 'wait-on-stale',
+  staleWait: 10,
   failureStrategy: 'protect-source',
 }
 createSwrClient({ redis, ...shared })

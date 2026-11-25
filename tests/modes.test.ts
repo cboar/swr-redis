@@ -57,8 +57,9 @@ test(
 
     await bgEntered
     callerAbort.abort()
-    assert.equal(bgSignal, undefined)
-    assert.equal(waitUntilPromises.length, 1)
+    assert.equal(bgSignal?.aborted, false)
+    // The cold fetch is tracked as well.
+    assert.equal(waitUntilPromises.length, 2)
 
     // Second stale caller while background refresh is in-flight also gets stale immediately
     assert.equal(await cache.get(), 'v-1')
@@ -74,7 +75,7 @@ test(
 )
 
 test(
-  'Mode swr (default): a failed background refresh keeps the stale entry and releases its lock',
+  'Mode swr (default): a failed background refresh keeps the stale entry and starts a cooldown',
   { timeout: 5000 },
   async (t) => {
     const redis = createFakeRedis(1000)
@@ -103,7 +104,7 @@ test(
 
     gate.resolve()
     await swr.flush()
-    assert.equal(await redis.get(lockKey('bg-failure')), null)
+    assert.equal(await redis.get(lockKey('bg-failure')), 'cooldown')
     assert.deepEqual(await redis.getBuffer(dataKey('bg-failure')), stored)
   },
 )
@@ -119,7 +120,7 @@ test(
     let calls = 0
     const cache = createSwrClient({
       redis,
-      mode: 'swr-serverless',
+      runtime: 'serverless',
     }).cache({
       key: 'item',
       ttl: 5,
@@ -166,7 +167,8 @@ for (const mode of ['swr-serverless', 'wait-on-stale'] as const) {
       let calls = 0
       const cache = createSwrClient({
         redis,
-        mode,
+        runtime: 'serverless',
+        staleWait: mode === 'wait-on-stale' ? 10 : 0,
       }).cache({
         key: 'failure',
         ttl: 5,
@@ -185,7 +187,7 @@ for (const mode of ['swr-serverless', 'wait-on-stale'] as const) {
         assert.equal(await cache.get(), 'stale')
       }
       assert.deepEqual(await redis.getBuffer(dataKey('failure')), stored)
-      assert.equal(await redis.get(lockKey('failure')), null)
+      assert.equal(await redis.get(lockKey('failure')), 'cooldown')
     })
   }
 }
@@ -199,7 +201,8 @@ test('wait-on-stale: loser waits for the winner commit', { timeout: 2000 }, asyn
   let calls = 0
   const cache = createSwrClient({
     redis,
-    mode: 'wait-on-stale',
+    runtime: 'serverless',
+    staleWait: 10,
     pollIntervalMs: 1,
     onEvent: (event) => {
       if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
@@ -229,7 +232,7 @@ test('wait-on-stale: loser waits for the winner commit', { timeout: 2000 }, asyn
 
 for (const fatal of [false, true]) {
   test(
-    `wait-on-stale: loser falls back after ${fatal ? 'fatal' : 'nonfatal'} winner failure releases its lock`,
+    `wait-on-stale: loser falls back after ${fatal ? 'fatal' : 'nonfatal'} winner failure starts a cooldown`,
     { timeout: 2000 },
     async (t) => {
       const redis = createFakeRedis(1000)
@@ -241,7 +244,8 @@ for (const fatal of [false, true]) {
       let calls = 0
       const cache = createSwrClient({
         redis,
-        mode: 'wait-on-stale',
+        runtime: 'serverless',
+        staleWait: 10,
         pollIntervalMs: 1,
         onEvent: (event) => {
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
@@ -268,7 +272,7 @@ for (const fatal of [false, true]) {
       release.resolve()
       await winnerResult
       assert.equal(await loser, 'stale')
-      assert.equal(await redis.get(lockKey('failed-winner')), null)
+      assert.equal(await redis.get(lockKey('failed-winner')), 'cooldown')
       assert.equal(calls, 2)
     },
   )
@@ -288,9 +292,9 @@ test(
     let calls = 0
     const cache = createSwrClient({
       redis,
-      mode: 'wait-on-stale',
+      runtime: 'serverless',
       failureStrategy: 'protect-source',
-      waitTimeout: 0.04,
+      staleWait: 0.04,
       pollIntervalMs: 10,
       onEvent: (event) => {
         if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()

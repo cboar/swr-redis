@@ -21,7 +21,7 @@ test('Events: read paths emit hit, miss, and refresh, stamped with the cache nam
   const swr = createSwrClient({
     redis,
     memory: true,
-    mode: 'swr-serverless',
+    runtime: 'serverless',
     onEvent,
   })
   const named = swr.cache({
@@ -215,7 +215,7 @@ test('Events: heartbeat renewal failures emit lock_renewal_failure stamped with 
     throw new Error('renew failed')
   }
   const { events, onEvent } = recorder()
-  const cache = createSwrClient({ redis, onEvent, lockTtl: 0.02, maxLockTtl: 1 }).cache({
+  const cache = createSwrClient({ redis, onEvent, lockTtl: 0.02 }).cache({
     name: 'slow',
     key: 'renew',
     fetch: async () => {

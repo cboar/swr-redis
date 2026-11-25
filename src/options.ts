@@ -8,7 +8,7 @@ import type {
   SwrCompressionOption,
   SwrFailureStrategy,
   SwrMemoryOptions,
-  SwrMode,
+  SwrRuntime,
   SwrSharedOptions,
   SwrTtlOption,
 } from './types.ts'
@@ -17,11 +17,12 @@ export const DEFAULTS = {
   prefix: 'default',
   ttl: 120,
   staleMultiplier: 5,
-  mode: 'swr',
+  runtime: 'server',
   failureStrategy: 'availability',
+  fetchTimeout: 30,
+  staleWait: 0,
+  failureCooldown: 1,
   lockTtl: 3,
-  maxLockTtlFloor: 30,
-  waitTimeout: 10,
   pollIntervalMs: 80,
   compression: { level: 1, minBytes: 256 },
   memory: { maxEntries: 1_000, maxTtl: Infinity, clone: false },
@@ -35,10 +36,11 @@ const MAX_REDIS_TTL_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
 
 export interface ResolvedClientOptions {
   readonly prefix: string
+  readonly runtime: SwrRuntime
   readonly codec: SwrCodec<unknown>
   readonly memory?: ResolvedMemory
   readonly failureStrategy: SwrFailureStrategy
-  /** Kept unmerged: each cache resolves them together with its own overrides. */
+  // Kept unmerged so each cache resolves overrides together.
   readonly shared: SwrSharedOptions
 }
 
@@ -46,11 +48,14 @@ export interface ResolvedCacheOptions<T, Context> {
   readonly keyOf: (context: Context) => string
   readonly ttl: SwrTtlOption<T, Context>
   readonly staleMultiplier: number
-  readonly mode: SwrMode
   readonly failureStrategy: SwrFailureStrategy
+  // Also caps how long a caller polls behind another fetch.
+  readonly fetchTimeoutMs: number
+  // 0 or Infinity allowed.
+  readonly staleWaitMs: number
+  // 0 disables the cooldown.
+  readonly failureCooldownMs: number
   readonly lockTtlMs: number
-  readonly maxLockTtlMs: number
-  readonly waitTimeoutMs: number
   readonly pollIntervalMs: number
   readonly compression: ResolvedCompression
   readonly isFatal?: (err: unknown) => boolean
@@ -69,12 +74,20 @@ export type ResolvedCompression = Required<Exclude<SwrCompressionOption, boolean
 export function resolveClientOptions(
   options: Omit<SwrClientOptions, 'redis' | 'onEvent' | 'waitUntil'>,
 ): ResolvedClientOptions {
-  const { prefix = DEFAULTS.prefix, memory, codec = DEFAULT_CODEC, ...shared } = options
+  const {
+    prefix = DEFAULTS.prefix,
+    runtime = DEFAULTS.runtime,
+    memory,
+    codec = DEFAULT_CODEC,
+    ...shared
+  } = options
   requireNonEmpty(prefix, 'prefix')
   validateFields(shared)
-  validateCrossFieldRules(shared)
+  // A cache may still complete these fields, so only check what the client sets.
+  if (shared.ttl !== undefined) toRedisTtlSeconds(shared.ttl, shared.staleMultiplier ?? 1)
   return {
     prefix,
+    runtime,
     codec,
     memory: resolveMemory(memory),
     failureStrategy: shared.failureStrategy ?? DEFAULTS.failureStrategy,
@@ -89,33 +102,33 @@ export function resolveCacheOptions<T, Context>(
   if (cache.name !== undefined) requireNonEmpty(cache.name, 'name')
   validateFields({ ...cache, ttl: numericTtl(cache.ttl) })
   const { shared } = client
-  const lockTtl = cache.lockTtl ?? shared.lockTtl ?? DEFAULTS.lockTtl
-  const merged = {
-    ttl: cache.ttl ?? shared.ttl ?? DEFAULTS.ttl,
-    staleMultiplier: cache.staleMultiplier ?? shared.staleMultiplier ?? DEFAULTS.staleMultiplier,
-    lockTtl,
-    maxLockTtl:
-      cache.maxLockTtl ?? shared.maxLockTtl ?? Math.max(DEFAULTS.maxLockTtlFloor, lockTtl),
-    waitTimeout: cache.waitTimeout ?? shared.waitTimeout ?? DEFAULTS.waitTimeout,
-  }
-  validateCrossFieldRules({ ...merged, ttl: numericTtl(merged.ttl) })
+  const ttl = cache.ttl ?? shared.ttl ?? DEFAULTS.ttl
+  const staleMultiplier =
+    cache.staleMultiplier ?? shared.staleMultiplier ?? DEFAULTS.staleMultiplier
+  if (typeof ttl === 'number') toRedisTtlSeconds(ttl, staleMultiplier)
 
-  const lockTtlMs = toMs(merged.lockTtl)
   return {
     keyOf: resolveKey(cache.key),
-    ttl: merged.ttl,
-    staleMultiplier: merged.staleMultiplier,
-    mode: cache.mode ?? shared.mode ?? DEFAULTS.mode,
+    ttl,
+    staleMultiplier,
     failureStrategy: cache.failureStrategy ?? client.failureStrategy,
-    lockTtlMs,
-    maxLockTtlMs: Math.max(lockTtlMs, toMs(merged.maxLockTtl)),
-    waitTimeoutMs: toMs(merged.waitTimeout),
+    fetchTimeoutMs: toMs(cache.fetchTimeout ?? shared.fetchTimeout ?? DEFAULTS.fetchTimeout),
+    staleWaitMs: toNonNegativeMs(cache.staleWait ?? shared.staleWait ?? DEFAULTS.staleWait),
+    failureCooldownMs: toNonNegativeMs(
+      cache.failureCooldown ?? shared.failureCooldown ?? DEFAULTS.failureCooldown,
+    ),
+    lockTtlMs: toMs(cache.lockTtl ?? shared.lockTtl ?? DEFAULTS.lockTtl),
     pollIntervalMs: cache.pollIntervalMs ?? shared.pollIntervalMs ?? DEFAULTS.pollIntervalMs,
     compression: resolveCompression(cache.compression ?? shared.compression),
     isFatal: cache.isFatal ?? shared.isFatal,
     codec: cache.codec ?? (client.codec as SwrCodec<T>),
     memoryEnabled: client.memory !== undefined && cache.memory !== false,
   }
+}
+
+export function resolveStaleWaitMs(staleWait: number): number {
+  validateStaleWait(staleWait)
+  return toNonNegativeMs(staleWait)
 }
 
 export function resolveMemory(
@@ -151,8 +164,16 @@ export function resolveCompression(option: SwrCompressionOption | undefined): Re
 }
 
 function validateFields(layer: SwrSharedOptions): void {
-  const { ttl, staleMultiplier, lockTtl, maxLockTtl, waitTimeout, pollIntervalMs, compression } =
-    layer
+  const {
+    ttl,
+    staleMultiplier,
+    fetchTimeout,
+    staleWait,
+    failureCooldown,
+    lockTtl,
+    pollIntervalMs,
+    compression,
+  } = layer
   const { level, minBytes } = typeof compression === 'object' ? compression : {}
 
   check(ttl, isPositiveFinite, 'ttl must be a positive finite number')
@@ -162,19 +183,20 @@ function validateFields(layer: SwrSharedOptions): void {
     'staleMultiplier must be a finite number >= 1',
   )
   check(
+    fetchTimeout,
+    isTimerSeconds,
+    `fetchTimeout must be a positive number of at most ${MAX_TIMER_MS / 1000} seconds`,
+  )
+  validateStaleWait(staleWait)
+  check(
+    failureCooldown,
+    (v) => v === 0 || isTimerSeconds(v),
+    `failureCooldown must be 0 or a positive number of at most ${MAX_TIMER_MS / 1000} seconds`,
+  )
+  check(
     lockTtl,
-    (v) => isPositiveFinite(v) && toMs(v) <= MAX_TIMER_MS,
+    isTimerSeconds,
     `lockTtl must be a positive number of at most ${MAX_TIMER_MS / 1000} seconds`,
-  )
-  check(
-    maxLockTtl,
-    isPositiveSafeMs,
-    'maxLockTtl must be a positive number of seconds that is a safe integer in ms',
-  )
-  check(
-    waitTimeout,
-    isPositiveSafeMs,
-    'waitTimeout must be a positive number of seconds that is a safe integer in ms',
   )
   check(
     pollIntervalMs,
@@ -193,13 +215,12 @@ function validateFields(layer: SwrSharedOptions): void {
   )
 }
 
-// On the client layer only the fields set there are combined; a cache may still complete them.
-function validateCrossFieldRules(options: SwrSharedOptions): void {
-  const { ttl, staleMultiplier, lockTtl, maxLockTtl } = options
-  if (ttl !== undefined) toRedisTtlSeconds(ttl, staleMultiplier ?? 1)
-  if (lockTtl !== undefined && maxLockTtl !== undefined && maxLockTtl < lockTtl) {
-    fail('maxLockTtl must be greater than or equal to lockTtl')
-  }
+function validateStaleWait(staleWait: number | undefined): void {
+  check(
+    staleWait,
+    (v) => v === 0 || v === Infinity || isTimerSeconds(v),
+    `staleWait must be 0, Infinity, or a positive number of at most ${MAX_TIMER_MS / 1000} seconds`,
+  )
 }
 
 function check<V>(value: V | undefined, valid: (value: V) => boolean, message: string): void {
@@ -223,13 +244,16 @@ export function toRedisTtlSeconds(ttl: number, staleMultiplier: number): number 
   return seconds
 }
 
-/** Positive seconds to whole milliseconds, at least 1. */
 function toMs(seconds: number): number {
   return Math.max(1, Math.round(seconds * 1000))
 }
 
-function isPositiveSafeMs(seconds: number): boolean {
-  return isPositiveFinite(seconds) && Number.isSafeInteger(toMs(seconds))
+function toNonNegativeMs(seconds: number): number {
+  return seconds === 0 || seconds === Infinity ? seconds : toMs(seconds)
+}
+
+function isTimerSeconds(seconds: number): boolean {
+  return isPositiveFinite(seconds) && toMs(seconds) <= MAX_TIMER_MS
 }
 
 function maxPollDelayMs(pollIntervalMs: number): number {

@@ -207,7 +207,7 @@ test('Custom codec encoding failure releases the lock without populating Redis o
     fetch: async () => 'ok',
   })
   await assert.rejects(cache.get(), (error) => error === failure)
-  assert.equal(await redis.get(lockKey('primary')), null)
+  assert.equal(await redis.get(lockKey('primary')), 'cooldown')
   assert.equal(await redis.getBuffer(dataKey('primary')), null)
   assert.equal(await fallbackReader.get(), 'fallback-primary')
 })
@@ -241,7 +241,7 @@ test('Header-first expiry check skips payload decoding for expired reads and sta
       trackedCodec,
     ),
   )
-  const swr = createSwrClient({ redis, mode: 'wait-on-stale', pollIntervalMs: 1 })
+  const swr = createSwrClient({ redis, runtime: 'serverless', staleWait: 10, pollIntervalMs: 1 })
   const expiredCache = swr.cache({
     key: 'expired',
     codec: trackedCodec,
@@ -305,7 +305,7 @@ test('Synchronous decoder crossing deadlines keeps the pre-decode read admission
       slowCodec,
     ),
   )
-  const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache({
+  const cache = createSwrClient({ redis, runtime: 'serverless' }).cache({
     key: 'slow-fresh',
     codec: slowCodec,
     fetch: async () => assert.fail('must not fetch when header was fresh before decode'),
@@ -372,7 +372,8 @@ for (const [path, fault, expectedEvents] of [
     const cache = createSwrClient({
       redis,
       memory: true,
-      mode: 'wait-on-stale',
+      runtime: 'serverless',
+      staleWait: 10,
       pollIntervalMs: 1,
       onEvent: (event) => events.push(event),
     }).cache({ key, codec, fetch: async () => `fetched-${++fetches}` })

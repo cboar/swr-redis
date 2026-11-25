@@ -26,7 +26,7 @@ export function readEnvelopeHeader(buffer: Uint8Array): EnvelopeHeader {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
   return {
     deflated: (view.getUint8(0) & FLAG_DEFLATED) === FLAG_DEFLATED,
-    // Freeze once to protect deadlines. Cheap enough to be worth enforcing at runtime.
+    // Freeze once so callers cannot mutate shared deadlines.
     timing: Object.freeze({
       cachedAtMs: view.getFloat64(1),
       freshUntilMs: view.getFloat64(9),

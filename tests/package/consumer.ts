@@ -48,6 +48,7 @@ const userCache = swr.cache<string | null, string>({
 })
 const metaCheck: SwrFetchMeta<string> = {
   key: (id) => id,
+  signal: new AbortController().signal,
   cacheWrite: 'attempt',
 }
 const user: Promise<string | null> = userCache.get('1', { memory: false })
