@@ -6,6 +6,9 @@ By default, callers get cached values while one process refreshes stale entries.
 
 [Documentation](https://cboar.github.io/swr-redis/) · [npm package](https://www.npmjs.com/package/swr-redis) · [GitHub](https://github.com/cboar/swr-redis)
 
+> [!IMPORTANT]
+> This branch is **v2**, which is in development and not yet published to npm. `npm install swr-redis` installs v1, documented on the [`v1` branch](https://github.com/cboar/swr-redis/tree/v1#readme).
+
 ## Install
 
 ```sh
