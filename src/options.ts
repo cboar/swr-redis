@@ -63,11 +63,7 @@ export interface ResolvedCacheOptions<T, Context> {
   readonly memoryEnabled: boolean
 }
 
-export interface ResolvedMemory {
-  readonly maxEntries: number
-  readonly maxTtlMs: number
-  readonly clone: boolean
-}
+export type ResolvedMemory = NonNullable<ReturnType<typeof resolveMemory>>
 
 export type ResolvedCompression = Required<Exclude<SwrCompressionOption, boolean>>
 
@@ -126,14 +122,12 @@ export function resolveCacheOptions<T, Context>(
   }
 }
 
-export function resolveStaleWaitMs(staleWait: number): number {
+export function resolveStaleWaitMs(staleWait: number) {
   validateStaleWait(staleWait)
   return toNonNegativeMs(staleWait)
 }
 
-export function resolveMemory(
-  option: boolean | SwrMemoryOptions | undefined,
-): ResolvedMemory | undefined {
+export function resolveMemory(option: boolean | SwrMemoryOptions | undefined) {
   if (!option) return undefined
   const { maxEntries, maxTtl, clone } = option === true ? {} : option
   check(maxEntries, isPositiveSafeInteger, 'memory.maxEntries must be a positive safe integer')
@@ -146,7 +140,7 @@ export function resolveMemory(
 }
 
 // A `ttl` callback is validated per result at write time instead.
-function numericTtl(ttl: unknown): number | undefined {
+function numericTtl(ttl: unknown) {
   return typeof ttl === 'number' ? ttl : undefined
 }
 
@@ -156,14 +150,14 @@ function resolveKey<Context>(key: string | ((context: Context) => string)) {
   return () => staticKey
 }
 
-export function resolveCompression(option: SwrCompressionOption | undefined): ResolvedCompression {
+export function resolveCompression(option: SwrCompressionOption | undefined) {
   if (option === false) return { level: 0, minBytes: 0 }
   const { level = DEFAULTS.compression.level, minBytes = DEFAULTS.compression.minBytes } =
     typeof option === 'object' ? option : {}
   return { level, minBytes }
 }
 
-function validateFields(layer: SwrSharedOptions): void {
+function validateFields(layer: SwrSharedOptions) {
   const {
     ttl,
     staleMultiplier,
@@ -215,7 +209,7 @@ function validateFields(layer: SwrSharedOptions): void {
   )
 }
 
-function validateStaleWait(staleWait: number | undefined): void {
+function validateStaleWait(staleWait: number | undefined) {
   check(
     staleWait,
     (v) => v === 0 || v === Infinity || isTimerSeconds(v),
@@ -223,7 +217,7 @@ function validateStaleWait(staleWait: number | undefined): void {
   )
 }
 
-function check<V>(value: V | undefined, valid: (value: V) => boolean, message: string): void {
+function check<V>(value: V | undefined, valid: (value: V) => boolean, message: string) {
   if (value !== undefined && !valid(value)) fail(message)
 }
 
@@ -231,12 +225,12 @@ function fail(message: string): never {
   throw new SwrValidationError(message)
 }
 
-export function requireTtl(ttl: number, label: string): number {
+export function requireTtl(ttl: number, label: string) {
   if (!isPositiveFinite(ttl)) fail(`${label} must be a positive finite number`)
   return ttl
 }
 
-export function toRedisTtlSeconds(ttl: number, staleMultiplier: number): number {
+export function toRedisTtlSeconds(ttl: number, staleMultiplier: number) {
   const seconds = Math.max(1, Math.ceil(ttl * staleMultiplier))
   if (!Number.isSafeInteger(seconds * 1000)) {
     fail(`Resolved Redis ttl exceeds maximum supported duration (${MAX_REDIS_TTL_SECONDS}s)`)
@@ -244,30 +238,30 @@ export function toRedisTtlSeconds(ttl: number, staleMultiplier: number): number 
   return seconds
 }
 
-function toMs(seconds: number): number {
+function toMs(seconds: number) {
   return Math.max(1, Math.round(seconds * 1000))
 }
 
-function toNonNegativeMs(seconds: number): number {
+function toNonNegativeMs(seconds: number) {
   return seconds === 0 || seconds === Infinity ? seconds : toMs(seconds)
 }
 
-function isTimerSeconds(seconds: number): boolean {
+function isTimerSeconds(seconds: number) {
   return isPositiveFinite(seconds) && toMs(seconds) <= MAX_TIMER_MS
 }
 
-function maxPollDelayMs(pollIntervalMs: number): number {
+function maxPollDelayMs(pollIntervalMs: number) {
   return pollIntervalMs + Math.floor(pollIntervalMs * POLL_JITTER)
 }
 
-function isPositiveFinite(value: number): boolean {
+function isPositiveFinite(value: number) {
   return Number.isFinite(value) && value > 0
 }
 
-export function isPositiveSafeInteger(value: number): boolean {
+export function isPositiveSafeInteger(value: number) {
   return Number.isSafeInteger(value) && value > 0
 }
 
-export function isNonNegativeSafeInteger(value: number): boolean {
+export function isNonNegativeSafeInteger(value: number) {
   return Number.isSafeInteger(value) && value >= 0
 }

@@ -8,14 +8,22 @@ import {
   type SwrCodec,
   type SwrEvent,
   type SwrFetchResult,
+  type SwrRuntime,
+  type SwrTimeoutPhase,
   type SwrWriteBatchInput,
 } from 'swr-redis'
 import { createSwrPaginatedCache, type SwrPaginatedPage } from 'swr-redis/pagination'
 import { Redis } from 'ioredis'
 
 const redis = new Redis({ lazyConnect: true })
+const runtime: SwrRuntime = 'serverless'
+const phase: SwrTimeoutPhase = 'wait'
 const swr = createSwrClient({
   redis,
+  runtime,
+  fetchTimeout: 7,
+  staleWait: 0.15,
+  failureCooldown: 0,
   compression: { level: 1, minBytes: 256 },
   onEvent: (event: SwrEvent) => {
     void event.type
@@ -115,6 +123,7 @@ const paginated: SwrCache<
 const pageRes: Promise<SwrPaginatedPage<{ id: string }>> = paginated.get({ page: 0 })
 
 void metaCheck
+void phase
 void res
 void setRes
 void user

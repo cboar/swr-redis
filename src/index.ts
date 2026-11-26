@@ -3,7 +3,6 @@ export { SwrNoCache, SwrWriteBatch } from './wrappers.ts'
 export { SwrCacheError, SwrTimeoutError, SwrRedisError, SwrValidationError } from './errors.ts'
 export type {
   SwrCache,
-  SwrCacheDefinition,
   SwrCacheOptions,
   SwrCacheWrite,
   SwrClient,

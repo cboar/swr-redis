@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { Redis } from 'ioredis'
-import { RedisLock, registerLockCommands } from '../../src/lock.ts'
+import { COOLDOWN_MARKER, RedisLock, registerLockCommands } from '../../src/lock.ts'
 
 // Shared command contract: the fake checks callers; real Redis executes the Lua.
 export function lockContract(
@@ -177,6 +177,68 @@ export function lockContract(
     assert.equal(await owner.release(), false)
   })
 
+  contract(
+    'COOLDOWN_LOCK_SCRIPT: swaps only the owner token for the marker, which no token can renew or release',
+    async (t) => {
+      const raw = await createRedis(t)
+      if (!raw) return
+      const redis = registerLockCommands(raw)
+      const owner = new RedisLock(redis, 'lock:cooldown:1')
+      const other = new RedisLock(redis, 'lock:cooldown:1')
+
+      assert.equal(await owner.acquire(10_000), 'acquired')
+      assert.equal(await other.cooldown(5000), false)
+      assert.equal(await redis.get(owner.key), owner.token)
+
+      assert.equal(await owner.cooldown(5000), true)
+      assert.equal(await redis.get(owner.key), COOLDOWN_MARKER)
+      await assertTtl(redis, owner.key, 5000)
+
+      assert.equal(await owner.cooldown(5000), false)
+      assert.equal(await owner.release(), false)
+      assert.equal(await redis.swrExtendLock(owner.key, owner.token, 50_000), '0')
+      assert.equal(await redis.get(owner.key), COOLDOWN_MARKER)
+      await assertTtl(redis, owner.key, 5000)
+    },
+  )
+
+  contract(
+    'COOLDOWN_LOCK_SCRIPT: writes no marker once the lock was cleared or expired',
+    async (t) => {
+      const raw = await createRedis(t)
+      if (!raw) return
+      const redis = registerLockCommands(raw)
+      const lock = new RedisLock(redis, 'lock:cooldown:cleared')
+
+      assert.equal(await lock.acquire(10_000), 'acquired')
+      await redis.unlink(lock.key)
+      assert.equal(await lock.cooldown(5000), false)
+      assert.equal(await redis.get(lock.key), null)
+    },
+  )
+
+  contract(
+    'ACQUIRE_LOCK_SCRIPT: reports cooldown, even to the previous owner, until the marker expires',
+    async (t) => {
+      const raw = await createRedis(t)
+      if (!raw) return
+      const redis = registerLockCommands(raw)
+      const owner = new RedisLock(redis, 'lock:cooldown:acquire')
+      const next = new RedisLock(redis, 'lock:cooldown:acquire')
+
+      assert.equal(await owner.acquire(10_000), 'acquired')
+      assert.equal(await owner.cooldown(5000), true)
+      assert.equal(await next.acquire(10_000), 'cooldown')
+      assert.equal(await owner.acquire(10_000), 'cooldown')
+      assert.equal(await redis.get(owner.key), COOLDOWN_MARKER)
+      await assertTtl(redis, owner.key, 5000)
+
+      await expire(redis, owner.key, 5000)
+      assert.equal(await next.acquire(10_000), 'acquired')
+      assert.equal(await redis.get(next.key), next.token)
+    },
+  )
+
   contract('EXTEND_LOCK_SCRIPT: extends TTL only if token matches', async (t) => {
     const raw = await createRedis(t)
     if (!raw) return
@@ -198,18 +260,28 @@ export function lockContract(
     assert.equal(await redis.get(lock.key), null)
   })
 
-  contract('SET_AND_CLEAR_LOCK_SCRIPT: sets data key and unlinks lock key', async (t) => {
-    const raw = await createRedis(t)
-    if (!raw) return
-    const redis = registerLockCommands(raw)
-    await new RedisLock(redis, 'lock:k1').acquire(5000)
+  contract(
+    'SET_AND_CLEAR_LOCK_SCRIPT: sets data key and unlinks an owner lock or a cooldown marker',
+    async (t) => {
+      const raw = await createRedis(t)
+      if (!raw) return
+      const redis = registerLockCommands(raw)
+      const owner = new RedisLock(redis, 'lock:k1')
+      await owner.acquire(5000)
 
-    const buf = Buffer.from('primed-value')
-    await redis.swrSetAndClearLock('data:k1', 'lock:k1', buf, 60)
+      const buf = Buffer.from('primed-value')
+      await redis.swrSetAndClearLock('data:k1', 'lock:k1', buf, 60)
 
-    assert.deepEqual(await redis.getBuffer('data:k1'), buf)
-    assert.equal(await redis.get('lock:k1'), null)
-  })
+      assert.deepEqual(await redis.getBuffer('data:k1'), buf)
+      assert.equal(await redis.get('lock:k1'), null)
+
+      await owner.acquire(5000)
+      await owner.cooldown(5000)
+      await redis.swrSetAndClearLock('data:k1', 'lock:k1', Buffer.from('fixed'), 60)
+      assert.equal(await redis.get('lock:k1'), null)
+      assert.equal(await new RedisLock(redis, 'lock:k1').acquire(5000), 'acquired')
+    },
+  )
 }
 
 async function assertTtl(redis: Redis, key: string, expected: number) {

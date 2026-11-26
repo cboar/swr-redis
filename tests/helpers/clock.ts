@@ -1,4 +1,5 @@
 import type { TestContext } from 'node:test'
+import { setImmediate } from 'node:timers/promises'
 import type { FakeRedis } from '../fake-redis.ts'
 
 const clocks = new WeakMap<TestContext, { redis: FakeRedis }>()
@@ -17,4 +18,11 @@ export function useRedisClock(t: TestContext, redis: FakeRedis): void {
   const state = { redis }
   clocks.set(t, state)
   t.mock.method(Date, 'now', () => state.redis.getTime())
+}
+
+/** Advance FakeRedis and the mocked timers together, then let command continuations run. */
+export async function tick(t: TestContext, redis: FakeRedis, ms: number): Promise<void> {
+  redis.advanceTime(ms)
+  t.mock.timers.tick(ms)
+  await setImmediate()
 }

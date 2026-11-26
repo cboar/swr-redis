@@ -1,17 +1,20 @@
 import type { Redis } from 'ioredis'
-import { registerLockCommands } from '../../src/lock.ts'
+import { registerLockCommands, type AcquireOutcome } from '../../src/lock.ts'
 
-export type Acquire = (key: string, token: string, ttlMs: number) => Promise<boolean>
+export type Acquire = (key: string, token: string, ttlMs: number) => Promise<AcquireOutcome>
 
 export function interceptAcquire(
   redis: Redis,
-  intercept: (acquire: Acquire, key: string, token: string, ttlMs: number) => Promise<boolean>,
+  intercept: (
+    acquire: Acquire,
+    key: string,
+    token: string,
+    ttlMs: number,
+  ) => Promise<AcquireOutcome>,
 ): void {
   const commands = registerLockCommands(redis)
-  const run = commands.swrAcquireLock.bind(redis)
-  const acquire: Acquire = async (...args) => (await run(...args)) === 'acquired'
-  commands.swrAcquireLock = async (...args) =>
-    (await intercept(acquire, ...args)) ? 'acquired' : 'busy'
+  const acquire: Acquire = commands.swrAcquireLock.bind(redis)
+  commands.swrAcquireLock = (...args) => intercept(acquire, ...args)
 }
 
 export function failAcquire(redis: Redis, error = new Error('acquire failed')): void {

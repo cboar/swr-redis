@@ -10,7 +10,9 @@ import {
   type SwrFetchMeta,
   type SwrGetResult,
   type SwrNonEmptyKeys,
+  type SwrRuntime,
   type SwrSharedOptions,
+  type SwrTimeoutPhase,
   type SwrTtlInput,
   type SwrTtlOption,
   type SwrCodec,
@@ -49,7 +51,7 @@ expectType<SwrEntryTiming | undefined>(getResult.timing)
 // Function key -> Context is inferred from key and flows into fetch.
 const userCache = swr.cache({
   key: (userId: string) => `user:${userId}`,
-  fetch: async (userId, { signal }) => ({ id: userId, aborted: Boolean(signal?.aborted) }),
+  fetch: async (userId, { signal }) => ({ id: userId, aborted: signal.aborted }),
 })
 expectType<Promise<{ id: string; aborted: boolean }>>(userCache.get('u_1'))
 // @ts-expect-error Missing required string context argument.
@@ -139,6 +141,42 @@ swr.cache({ key: 'k', ttl: async () => 10, fetch: async () => 'a' })
 // @ts-expect-error NoInfer prevents the ttl callback from overriding the fetched value type.
 swr.cache({ key: 'k', ttl: ({ value }: { value: number }) => value, fetch: async () => 'a' })
 
+// staleWait can be set per call. fetchTimeout and failureCooldown protect the source, and runtime
+// describes the deployment, so none of them can.
+createSwrClient({
+  redis,
+  runtime: 'serverless',
+  fetchTimeout: 7,
+  staleWait: 0.15,
+  failureCooldown: 0,
+})
+swr.cache({
+  key: 'k',
+  fetchTimeout: 5,
+  staleWait: Infinity,
+  failureCooldown: 30,
+  fetch: async () => 'ok',
+})
+userCache.get('u_1', { staleWait: 0, signal: AbortSignal.timeout(800) })
+// @ts-expect-error runtime is a client option.
+swr.cache({ key: 'k', runtime: 'serverless', fetch: async () => 'ok' })
+// @ts-expect-error fetchTimeout is not a per-call option.
+userCache.get('u_1', { fetchTimeout: 1 })
+// @ts-expect-error failureCooldown is not a per-call option.
+userCache.get('u_1', { failureCooldown: 0 })
+// @ts-expect-error mode was replaced by staleWait and runtime.
+createSwrClient({ redis, mode: 'swr' })
+// @ts-expect-error waitTimeout was removed.
+createSwrClient({ redis, waitTimeout: 10 })
+// @ts-expect-error maxLockTtl was replaced by fetchTimeout.
+createSwrClient({ redis, maxLockTtl: 30 })
+expectType<SwrRuntime>('server')
+// @ts-expect-error Unknown runtime.
+expectType<SwrRuntime>('edge')
+// @ts-expect-error The library always provides meta.signal.
+const metaWithoutSignal: SwrFetchMeta = { key: () => 'k', cacheWrite: 'attempt' }
+void metaWithoutSignal
+
 // Exported shared option and TTL types describe the options.
 const shared: SwrSharedOptions = {
   ttl: 60,
@@ -166,7 +204,11 @@ if (evt.type === 'error') {
     // @ts-expect-error Narrow the thrown value before reading error properties.
     void evt.err.message
   }
-  if (evt.reason === 'timeout') expectType<number>(evt.err.elapsedMs + evt.durationMs)
+  if (evt.reason === 'timeout') {
+    expectType<number>(evt.err.elapsedMs + evt.durationMs)
+    expectType<'warn' | 'error'>(evt.severity)
+    expectType<SwrTimeoutPhase>(evt.err.phase)
+  }
   if (evt.reason === 'lock_lost') {
     expectType<number>(evt.durationMs)
     // @ts-expect-error A lost lock carries no error.
@@ -254,7 +296,7 @@ createSwrPaginatedCache(swr, {
   pageSize: 10,
   pageIndex: (ctx: { page: number }) => ctx.page,
   key: (_ctx, p, s) => `invalid:${p}:${s}`,
-  // @ts-expect-error Primitive fetch result does not satisfy SwrPaginationFetchResult.
+  // @ts-expect-error Primitive fetch result does not satisfy SwrPaginationData | SwrNoCache.
   fetch: async () => 42,
 })
 

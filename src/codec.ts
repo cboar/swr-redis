@@ -8,10 +8,7 @@ export interface Envelope<T> {
   readonly timing: SwrEntryTiming
 }
 
-export interface EnvelopeHeader {
-  readonly deflated: boolean
-  readonly timing: SwrEntryTiming
-}
+type EnvelopeHeader = ReturnType<typeof readEnvelopeHeader>
 
 // Envelope layout in DECISIONS.md.
 export const ENVELOPE_HEADER_SIZE = 25
@@ -22,7 +19,7 @@ export const DEFAULT_CODEC: SwrCodec<unknown> = {
   decode: (bytes) => BSON.deserialize(bytes, { promoteBuffers: true }).v,
 }
 
-export function readEnvelopeHeader(buffer: Uint8Array): EnvelopeHeader {
+export function readEnvelopeHeader(buffer: Uint8Array) {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
   return {
     deflated: (view.getUint8(0) & FLAG_DEFLATED) === FLAG_DEFLATED,
@@ -40,7 +37,7 @@ export function encodeEnvelope<T>(
   timing: SwrEntryTiming,
   codec: Pick<SwrCodec<T>, 'encode'>,
   compression: ResolvedCompression,
-): Buffer {
+) {
   const payload = codec.encode(value)
   const deflated = compression.level > 0 && payload.byteLength >= compression.minBytes
   const body = deflated ? zlib.deflateSync(payload, { level: compression.level }) : payload
@@ -58,7 +55,7 @@ export function decodeEnvelopeValue<T>(
   buffer: Uint8Array,
   header: EnvelopeHeader,
   codec: Pick<SwrCodec<T>, 'decode'>,
-): T {
+) {
   const payload = buffer.subarray(ENVELOPE_HEADER_SIZE)
   return codec.decode(header.deflated ? zlib.inflateSync(payload) : payload)
 }

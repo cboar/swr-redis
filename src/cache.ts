@@ -1,7 +1,7 @@
 import type { ClientInternals } from './client.ts'
 import { decodeEnvelopeValue, encodeEnvelope, readEnvelopeHeader, type Envelope } from './codec.ts'
 import { DirectFetches } from './direct.ts'
-import { isFatalError, SwrTimeoutError, SwrValidationError, type SwrRedisError } from './errors.ts'
+import { isFatalError, SwrTimeoutError, SwrValidationError } from './errors.ts'
 import {
   bindCacheEmitter,
   errorEvent,
@@ -105,11 +105,11 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     )
   }
 
-  key(context: Context): string {
+  key(context: Context) {
     return this.options.keyOf(context)
   }
 
-  async get(context: Context, options?: SwrGetOptions): Promise<T> {
+  async get(context: Context, options?: SwrGetOptions) {
     return (await this.getWithMeta(context, options)).value
   }
 
@@ -170,7 +170,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return cached(entry.envelope, 'redis')
   }
 
-  async set(context: Context, value: T): Promise<void> {
+  async set(context: Context, value: T) {
     const { redis, keys, memory } = this.client
     const key = this.options.keyOf(context)
     const ttl = this.resolvePrimaryTtl(context, key, value)
@@ -194,7 +194,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     memory.settle(pending, 'populate')
   }
 
-  async invalidate(context: Context): Promise<void> {
+  async invalidate(context: Context) {
     await this.client.invalidate(
       [this.options.keyOf(context)],
       this.options.failureStrategy,
@@ -205,7 +205,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   private async guardedRead<R>(
     req: CacheRequest<Context>,
     read: (guard: ReadGuard | undefined) => Promise<R>,
-  ): Promise<R> {
+  ) {
     const { memory } = this.client
     const guard = req.useMemory ? memory.beginRead(req.key) : undefined
     try {
@@ -235,6 +235,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         await release
         throw signal.reason
       }
+      this.client.track(release, req.waitUntil)
       return { status: 'redis_error', err }
     }
     if (signal?.aborted) {
@@ -271,7 +272,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     }
   }
 
-  private async onColdMiss(req: CacheRequest<Context>): Promise<SwrGetResult<T>> {
+  private async onColdMiss(req: CacheRequest<Context>) {
     const attempt = await this.tryLock(req)
     if (attempt.status === 'redis_error') return this.onRedisError(req, attempt.err)
 
@@ -361,7 +362,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 
   private pollSnapshot(req: CacheRequest<Context>, accept: Accept): Promise<PollSnapshot<T>> {
-    return this.guardedRead(req, async (guard): Promise<PollSnapshot<T>> => {
+    return this.guardedRead(req, async (guard) => {
       let data: Buffer | null | undefined
       let lock: Buffer | null | undefined
       try {
@@ -384,7 +385,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     outcome: PollOutcome,
     progress: PollProgress,
     durationMs?: number,
-  ): void {
+  ) {
     this.emit?.({
       type: 'poll',
       outcome,
@@ -399,7 +400,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     lock: RedisLock,
     trigger: RefreshTrigger,
     stale?: Envelope<T>,
-  ): Promise<SwrGetResult<T>> {
+  ) {
     // onEvent listeners run after tryLock and may abort the caller.
     if (req.signal?.aborted) {
       await this.safeRelease(req, lock)
@@ -461,11 +462,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return { kind: 'ok', result: await this.commit(req, lock, prepared, trigger) }
   }
 
-  private async endFailedRefresh(
-    req: CacheRequest<Context>,
-    lock: RedisLock,
-    lockLost: boolean,
-  ): Promise<void> {
+  private async endFailedRefresh(req: CacheRequest<Context>, lock: RedisLock, lockLost: boolean) {
     if (lockLost) return
     const { failureCooldownMs } = this.options
     if (failureCooldownMs === 0) return this.safeRelease(req, lock)
@@ -503,7 +500,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 
   // A throwing isFatal makes its own error the fatal one, so the refresh still never rejects.
-  private classifyFailure(err: unknown): { err: unknown; fatal: boolean } {
+  private classifyFailure(err: unknown) {
     try {
       return { err, fatal: isFatalError(err, this.options.isFatal) }
     } catch (thrown) {
@@ -511,13 +508,13 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     }
   }
 
-  private async onRedisError(req: CacheRequest<Context>, err: unknown): Promise<SwrGetResult<T>> {
+  private async onRedisError(req: CacheRequest<Context>, err: unknown) {
     const redisError = this.reportRedisError(req.key, err)
     if (redisError) throw redisError
     return this.fetchDirect(req)
   }
 
-  private async fetchDirect(req: CacheRequest<Context>): Promise<SwrGetResult<T>> {
+  private async fetchDirect(req: CacheRequest<Context>) {
     req.signal?.throwIfAborted()
     const outcome = await this.directFetches.run(req.key, req.signal, () =>
       startBoundedFetch(req.key, this.options.fetchTimeoutMs, (signal) =>
@@ -528,7 +525,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     throw outcome.err // reported once per fetch through DirectFetches' onFailed
   }
 
-  private async fetchUncached(req: CacheRequest<Context>, signal: AbortSignal): Promise<T> {
+  private async fetchUncached(req: CacheRequest<Context>, signal: AbortSignal) {
     const result = await this.fetch(req.context, {
       key: this.options.keyOf,
       signal,
@@ -546,12 +543,12 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     stale: Envelope<T>,
     stage: StaleFallbackStage,
     err: unknown,
-  ): SwrGetResult<T> {
+  ) {
     this.emit?.(errorEvent('stale_fallback', key, { stage, err }))
     return cached(stale, 'redis')
   }
 
-  private reportRedisError(key: string, err: unknown): SwrRedisError | undefined {
+  private reportRedisError(key: string, err: unknown) {
     return reportRedisError([key], err, this.options.failureStrategy, this.emit)
   }
 
@@ -597,7 +594,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     lock: RedisLock,
     prepared: Extract<PreparedCommit<T>, { kind: 'write' }>,
     trigger: RefreshTrigger,
-  ): Promise<SwrGetResult<T>> {
+  ) {
     const { memory } = this.client
     const { value, entries, durationMs } = prepared
     const pending = memory.beginWrite(entries)
@@ -627,7 +624,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return fetched(value, committed ? entries[0].timing : undefined)
   }
 
-  private async safeRelease(req: CacheRequest<Context>, lock: RedisLock): Promise<void> {
+  private async safeRelease(req: CacheRequest<Context>, lock: RedisLock) {
     try {
       await lock.release()
     } catch (err) {
@@ -657,7 +654,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return { timing, buffer, ttlSeconds, envelope: { value: memoryValue, timing } }
   }
 
-  private resolvePrimaryTtl(context: Context, key: string, value: T): number {
+  private resolvePrimaryTtl(context: Context, key: string, value: T) {
     const { ttl } = this.options
     if (typeof ttl === 'number') return ttl
     return requireTtl(ttl({ context, key, value }), 'ttl callback result')
@@ -672,7 +669,7 @@ function cached<T>(entry: Envelope<T>, source: 'memory' | 'redis'): SwrGetResult
   return { value: entry.value, source, timing: entry.timing }
 }
 
-function unwrapRefresh<T>(outcome: RefreshOutcome<T>): SwrGetResult<T> {
+function unwrapRefresh<T>(outcome: RefreshOutcome<T>) {
   if (outcome.kind === 'ok') return outcome.result
   if (outcome.fallback) return cached(outcome.fallback, 'redis')
   throw outcome.err
@@ -694,7 +691,7 @@ function decodeEntry<T>(buf: Buffer | null, accept: Accept, codec: SwrCodec<T>) 
   return { envelope: { value, timing }, fresh: now < timing.freshUntilMs, now }
 }
 
-function validateBatch(batch: SwrWriteBatch<unknown>, primaryKey: string): void {
+function validateBatch(batch: SwrWriteBatch<unknown>, primaryKey: string) {
   if (batch.ttl !== undefined) requireTtl(batch.ttl, 'batch ttl')
   const seenKeys = new Set([primaryKey])
   for (const { key, ttl } of batch.secondary) {

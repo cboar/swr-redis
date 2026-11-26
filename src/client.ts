@@ -39,7 +39,7 @@ export function createSwrClient(options: SwrClientOptions): SwrClient {
       }
     },
 
-    async invalidateKeys(...keys: string[]): Promise<void> {
+    async invalidateKeys(...keys: string[]) {
       const [first, ...rest] = keys
       if (first === undefined) return
       for (const key of keys) requireNonEmpty(key, 'key')

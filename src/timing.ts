@@ -118,7 +118,7 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-export function pollDelayMs(pollIntervalMs: number, limitMs: number, elapsedMs: number): number {
+export function pollDelayMs(pollIntervalMs: number, limitMs: number, elapsedMs: number) {
   const jitter = Math.floor(Math.random() * (Math.floor(pollIntervalMs * POLL_JITTER) + 1))
   return Math.min(pollIntervalMs + jitter, Math.max(1, limitMs - elapsedMs))
 }

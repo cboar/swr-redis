@@ -171,8 +171,12 @@ export interface SwrWriteBatchInput<T> {
 /** A fetched value, optionally wrapped in `SwrWriteBatch` or `SwrNoCache`. */
 export type SwrFetchResult<T> = T | SwrWriteBatch<T> | SwrNoCache<T>
 
-// Keep the fetched result separate from the cached value so inference can unwrap it afterwards.
-export interface SwrCacheDefinition<T, Context, Result> extends Omit<SwrSharedOptions, 'ttl'> {
+// Keep `Result` separate from `T` so inference can unwrap `SwrNoCache` / `SwrWriteBatch` afterwards.
+export interface SwrCacheOptions<
+  T = unknown,
+  Context = void,
+  Result = SwrFetchResult<T>,
+> extends Omit<SwrSharedOptions, 'ttl'> {
   key: string | ((context: Context) => string)
   /** May return a value, `SwrNoCache`, or `SwrWriteBatch`. */
   fetch: (context: Context, meta: SwrFetchMeta<Context>) => Promise<Result>
@@ -185,12 +189,6 @@ export interface SwrCacheDefinition<T, Context, Result> extends Omit<SwrSharedOp
   /** Codec for this cache. Default: client `codec` (BSON). */
   codec?: SwrCodec<T>
 }
-
-export interface SwrCacheOptions<T = unknown, Context = void> extends SwrCacheDefinition<
-  T,
-  Context,
-  SwrFetchResult<T>
-> {}
 
 /** Writer-set deadlines of a cached value, as wall-clock milliseconds. */
 export interface SwrEntryTiming {
@@ -238,7 +236,7 @@ export interface SwrClient {
   cache: {
     // Infer the complete result before unwrapping; plain objects resembling wrappers stay intact.
     <Result, Context = void>(
-      options: SwrCacheDefinition<SwrUnwrapFetchResult<Result>, Context, Result>,
+      options: SwrCacheOptions<SwrUnwrapFetchResult<Result>, Context, Result>,
     ): SwrCache<SwrUnwrapFetchResult<Result>, Context>
     // Explicit type arguments describe the cached value, allowing SwrNoCache and SwrWriteBatch in fetch.
     <T = unknown, Context = void>(options: SwrCacheOptions<T, Context>): SwrCache<T, Context>

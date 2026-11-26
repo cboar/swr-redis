@@ -8,7 +8,7 @@ import {
   SwrWriteBatch,
   type SwrCodec,
 } from '../src/index.ts'
-import { registerLockCommands } from '../src/lock.ts'
+import { COOLDOWN_MARKER, registerLockCommands } from '../src/lock.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { decodeEnvelope } from './helpers/envelope.ts'
@@ -162,7 +162,7 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
   }
 })
 
-test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secondary keys before Redis and releases lock', async (t) => {
+test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secondary keys before Redis and starts a cooldown', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const swr = createSwrClient({ redis, memory: true })
@@ -182,7 +182,7 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
       err instanceof SwrValidationError &&
       err.message.includes('Duplicate cache write key: "dup:p1"'),
   )
-  assert.equal(await redis.get(toLockKey('dup:p1')), 'cooldown')
+  assert.equal(await redis.get(toLockKey('dup:p1')), COOLDOWN_MARKER)
   assert.equal(await redis.getBuffer(toDataKey('dup:p1')), null)
 
   // 2. Duplicate secondary keys
@@ -203,7 +203,7 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
       err instanceof SwrValidationError &&
       err.message.includes('Duplicate cache write key: "norm:alpha"'),
   )
-  assert.equal(await redis.get(toLockKey('norm:root')), 'cooldown')
+  assert.equal(await redis.get(toLockKey('norm:root')), COOLDOWN_MARKER)
   assert.equal(await redis.getBuffer(toDataKey('norm:root')), null)
   assert.equal(await redis.getBuffer(toDataKey('norm:alpha')), null)
 
@@ -217,11 +217,11 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
       }),
   })
   await assert.rejects(() => emptySec.get('valid-primary'), SwrValidationError)
-  assert.equal(await redis.get(toLockKey('valid-primary')), 'cooldown')
+  assert.equal(await redis.get(toLockKey('valid-primary')), COOLDOWN_MARKER)
   assert.equal(await redis.getBuffer(toDataKey('valid-primary')), null)
 })
 
-test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/memory write and releases lock', async (t) => {
+test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/memory write and starts a cooldown', async (t) => {
   const badTtls = [
     0,
     -2,
@@ -253,7 +253,7 @@ test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/mem
       () => badBatchTtl.get('p'),
       (err: unknown) => err instanceof SwrValidationError && err.message.includes('ttl'),
     )
-    assert.equal(await redis.get(toLockKey('bad-batch:p')), 'cooldown')
+    assert.equal(await redis.get(toLockKey('bad-batch:p')), COOLDOWN_MARKER)
     assert.equal(await redis.getBuffer(toDataKey('bad-batch:p')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-batch:sec')), null)
 
@@ -273,14 +273,14 @@ test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/mem
       () => badSecTtl.get('p'),
       (err: unknown) => err instanceof SwrValidationError && err.message.includes('ttl'),
     )
-    assert.equal(await redis.get(toLockKey('bad-sec:p')), 'cooldown')
+    assert.equal(await redis.get(toLockKey('bad-sec:p')), COOLDOWN_MARKER)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:p')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:valid-before')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:invalid')), null)
   }
 })
 
-test('SwrWriteBatch: encoding error on secondary fails preparation before Redis and releases lock', async (t) => {
+test('SwrWriteBatch: encoding error on secondary fails preparation before Redis and starts a cooldown', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const swr = createSwrClient({ redis, memory: true })
@@ -316,7 +316,7 @@ test('SwrWriteBatch: encoding error on secondary fails preparation before Redis 
     (err) => err === encodeError,
   )
   assert.equal(commitCalls, 0)
-  assert.equal(await redis.get(toLockKey('enc:primary')), 'cooldown')
+  assert.equal(await redis.get(toLockKey('enc:primary')), COOLDOWN_MARKER)
   assert.equal(await redis.getBuffer(toDataKey('enc:primary')), null)
   assert.equal(await redis.getBuffer(toDataKey('enc:good')), null)
 })

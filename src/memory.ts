@@ -14,7 +14,7 @@ export interface MemoryWrite {
 
 export type PendingWrites = ReadonlyArray<MemoryWrite & { version: number }>
 
-export type SettleOutcome = 'populate' | 'evict'
+type SettleOutcome = 'populate' | 'evict'
 
 export interface MemoryStore {
   readonly clones: boolean
@@ -49,15 +49,15 @@ export class LruMemory implements MemoryStore {
     this.clones = options.clone
   }
 
-  get entryCount(): number {
+  get entryCount() {
     return this.entries.size
   }
 
-  get versionCount(): number {
+  get versionCount() {
     return this.versions.size
   }
 
-  get<T>(key: string, now: number): Envelope<T> | undefined {
+  get<T>(key: string, now: number) {
     const entry = this.entries.get(key)
     if (!entry) return undefined
 
@@ -71,15 +71,15 @@ export class LruMemory implements MemoryStore {
     ) as Envelope<T>
   }
 
-  beginRead(key: string): ReadGuard {
+  beginRead(key: string) {
     return { key, version: this.versions.acquire(key) }
   }
 
-  endRead(guard: ReadGuard | undefined): void {
+  endRead(guard: ReadGuard | undefined) {
     if (guard) this.versions.release(guard.key)
   }
 
-  populate(guard: ReadGuard | undefined, envelope: Envelope<unknown>, now: number): void {
+  populate(guard: ReadGuard | undefined, envelope: Envelope<unknown>, now: number) {
     if (!guard || now - envelope.timing.cachedAtMs >= this.maxTtlMs) return
     if (this.versions.current(guard.key) !== guard.version) return
     if (!this.clones) {
@@ -101,7 +101,7 @@ export class LruMemory implements MemoryStore {
     }))
   }
 
-  settle(pending: PendingWrites, outcome: SettleOutcome): void {
+  settle(pending: PendingWrites, outcome: SettleOutcome) {
     for (const { key, envelope, version } of pending) {
       const uncontested = this.versions.endWrite(key, version)
       // If another write to the key finished meanwhile, which one Redis applied last is unknown.
@@ -110,7 +110,7 @@ export class LruMemory implements MemoryStore {
     }
   }
 
-  private store(key: string, envelope: Envelope<unknown>): void {
+  private store(key: string, envelope: Envelope<unknown>) {
     if (this.entries.has(key)) {
       this.entries.delete(key)
     } else if (this.entries.size >= this.maxEntries) {
@@ -124,11 +124,11 @@ export class LruMemory implements MemoryStore {
 class KeyVersions {
   private readonly versions = new Map<string, { version: number; refs: number }>()
 
-  get size(): number {
+  get size() {
     return this.versions.size
   }
 
-  acquire(key: string): number {
+  acquire(key: string) {
     let v = this.versions.get(key)
     if (!v) {
       v = { version: 0, refs: 0 }
@@ -138,11 +138,11 @@ class KeyVersions {
     return v.version
   }
 
-  current(key: string): number {
+  current(key: string) {
     return this.versions.get(key)!.version
   }
 
-  endWrite(key: string, version: number): boolean {
+  endWrite(key: string, version: number) {
     const v = this.versions.get(key)!
     const uncontested = v.version === version
     v.version++
@@ -150,7 +150,7 @@ class KeyVersions {
     return uncontested
   }
 
-  release(key: string, v = this.versions.get(key)!): void {
+  release(key: string, v = this.versions.get(key)!) {
     if (--v.refs === 0) this.versions.delete(key)
   }
 }

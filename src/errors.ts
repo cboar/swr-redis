@@ -8,7 +8,7 @@ export class SwrCacheError extends Error {
   }
 }
 
-export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boolean): boolean {
+export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boolean) {
   // A timeout from a nested cache is an ordinary failure; a custom isFatal can still match it.
   if (err instanceof SwrCacheError && !(err instanceof SwrTimeoutError)) return true
   return customIsFatal?.(err) ?? false

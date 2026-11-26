@@ -4,6 +4,7 @@ import { createFakeRedis } from './fake-redis.ts'
 import { createSwrClient, SwrNoCache, SwrValidationError, type SwrCodec } from '../src/index.ts'
 import { createSwrPaginatedCache, type SwrPaginatedPage } from '../src/pagination/index.ts'
 import { createRedisKeys } from '../src/keys.ts'
+import { COOLDOWN_MARKER } from '../src/lock.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { useRedisClock } from './helpers/clock.ts'
 
@@ -369,7 +370,7 @@ test('createSwrPaginatedCache: single page codec round-trips primary and prefetc
   await swr.flush()
 })
 
-test('createSwrPaginatedCache: a default swr stale refresh warms secondary pages in the tracked background refresh', async (t) => {
+test('createSwrPaginatedCache: a default (staleWait 0) stale refresh warms secondary pages in the tracked background refresh', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const waitUntilPromises: Promise<unknown>[] = []
@@ -462,7 +463,7 @@ test('createSwrPaginatedCache: a secondary clone failure fails the batch before 
   await cache.set(1, { docs: [{ id: 99 }], pageIndex: 1, pageSize: 1 })
 
   await assert.rejects(() => cache.get(0), { name: 'DataCloneError' })
-  assert.equal(await redis.get(lockKey('clone:p0')), 'cooldown')
+  assert.equal(await redis.get(lockKey('clone:p0')), COOLDOWN_MARKER)
   for (const page of [0, 2]) assert.equal(await redis.getBuffer(dataKey(`clone:p${page}`)), null)
   let reads = 0
   const getBuffer = redis.getBuffer.bind(redis)
@@ -474,7 +475,7 @@ test('createSwrPaginatedCache: a secondary clone failure fails the batch before 
   assert.equal(reads, 0)
 })
 
-test('createSwrPaginatedCache: a throwing key callback for a secondary page fails the batch before Redis and releases the lock', async (t) => {
+test('createSwrPaginatedCache: a throwing key callback for a secondary page fails the batch before Redis and starts a cooldown', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const swr = createSwrClient({ redis, memory: true })
@@ -494,7 +495,7 @@ test('createSwrPaginatedCache: a throwing key callback for a secondary page fail
     () => keyFailure.get(0),
     (err) => err === keyError,
   )
-  assert.equal(await redis.get(lockKey('key-failure:p0')), 'cooldown')
+  assert.equal(await redis.get(lockKey('key-failure:p0')), COOLDOWN_MARKER)
   assert.equal(await redis.getBuffer(dataKey('key-failure:p0')), null)
   assert.equal(await redis.getBuffer(dataKey('key-failure:p2')), null)
 })

@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { SwrCacheImpl } from '../src/cache.ts'
 import { createClientInternals, type ClientInternals } from '../src/client.ts'
+import type { Envelope } from '../src/codec.ts'
 import { createEventEmitter } from '../src/events.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { registerLockCommands } from '../src/lock.ts'
@@ -17,9 +18,14 @@ import { createFakeRedis } from './fake-redis.ts'
 import { decodeEnvelope, encodeEnvelope } from './helpers/envelope.ts'
 import { createLruMemory } from './helpers/memory-harness.ts'
 
-// The v1 stale modes, expressed with runtime and staleWait.
-type Mode = 'swr' | 'swr-serverless' | 'wait-on-stale'
-const MODES: readonly Mode[] = ['swr', 'swr-serverless', 'wait-on-stale']
+// Stale handling: the winner detaches at once, waits up to staleWait, or refreshes inline. A
+// waitUntil hook lets a serverless winner detach, so only the inline config runs without one.
+const STALE_HANDLING = {
+  detached: { runtime: 'server', staleWait: 0 },
+  staleWait: { runtime: 'server', staleWait: 2 },
+  inline: { runtime: 'serverless', staleWait: 0 },
+} as const
+type StaleHandling = keyof typeof STALE_HANDLING
 const ORDERS = ['fifo', 'reordered'] as const
 const FAULTS = ['lost-replies', 'resends-and-set-failures'] as const
 const RUNS = Number(process.env.MEMORY_MODEL_RUNS ?? 200)
@@ -56,7 +62,7 @@ interface Command {
 interface Proc {
   name: string
   memory: LruMemory
-  entries: Map<string, { value: unknown; freshUntilMs: number }>
+  entries: Map<string, Envelope<unknown>>
   internals: ClientInternals
   queue: Command[]
   constraints: Record<Key, number>
@@ -99,7 +105,7 @@ function faultFor(faults: Faults, name: string, r: number): Fault {
 async function runOnce(
   t: TestContext,
   seed: number,
-  mode: Mode,
+  stale: StaleHandling,
   order: Order,
   faults: Faults,
   stats: Stats,
@@ -222,8 +228,7 @@ async function runOnce(
         // Long enough that the schedule's mock-timer ticks never time out a fetch or a waiter.
         fetchTimeout: 3600,
         pollIntervalMs: 1,
-        runtime: mode === 'swr' ? 'server' : 'serverless',
-        staleWait: mode === 'wait-on-stale' ? 2 : 0,
+        ...STALE_HANDLING[stale],
         memory: true,
       }),
       emit: createEventEmitter((event) => {
@@ -234,15 +239,19 @@ async function runOnce(
         )
       }),
       // Background refresh writes count once the background promise settles.
-      waitUntil: (promise) => {
-        const ctx = als.getStore()
-        runningTrack(
-          promise.then(
-            () => ctx && applyConstraints(ctx),
-            (err: unknown) => failures.push(`${name} background refresh rejected: ${String(err)}`),
-          ),
-        )
-      },
+      waitUntil:
+        stale === 'inline'
+          ? undefined
+          : (promise) => {
+              const ctx = als.getStore()
+              runningTrack(
+                promise.then(
+                  () => ctx && applyConstraints(ctx),
+                  (err: unknown) =>
+                    failures.push(`${name} background refresh rejected: ${String(err)}`),
+                ),
+              )
+            },
     })
     const fetchValue = async (label: string) => {
       await gate()
@@ -356,7 +365,7 @@ async function runOnce(
         if (!entry) continue
         const at = seqOfValue[key].get(entry.value)
         if (at === undefined) return `${proc.name} memory[${key}]=${entry.value} was never in Redis`
-        if (now < entry.freshUntilMs && at < proc.constraints[key]) {
+        if (now < entry.timing.freshUntilMs && at < proc.constraints[key]) {
           return `${proc.name} memory[${key}]=${entry.value} (@${at}) is older than its completed write @${proc.constraints[key]}`
         }
       }
@@ -385,7 +394,7 @@ async function runOnce(
   }
 
   const describe = (problem: string) =>
-    `${problem}\n  seed=${seed} spread=${spread} mode=${mode} order=${order} faults=${faults}\n  ops: ${trace.join(', ')}\n  trace:\n    ${log.slice(-300).join('\n    ')}`
+    `${problem}\n  seed=${seed} spread=${spread} stale=${stale} order=${order} faults=${faults}\n  ops: ${trace.join(', ')}\n  trace:\n    ${log.slice(-300).join('\n    ')}`
 
   try {
     for (let step = 0; ; step++) {
@@ -459,9 +468,9 @@ const only = process.env.MEMORY_MODEL_SEED ? Number(process.env.MEMORY_MODEL_SEE
 let configIndex = 0
 for (const faults of FAULTS) {
   for (const order of ORDERS) {
-    for (const mode of MODES) {
+    for (const stale of Object.keys(STALE_HANDLING) as StaleHandling[]) {
       const firstSeed = ++configIndex * 1000
-      test(`Memory model: ${mode}, ${order}, ${faults}`, async (t) => {
+      test(`Memory model: ${stale} refresh, ${order}, ${faults}`, async (t) => {
         const stats: Stats = {
           memoryHits: 0,
           staleHits: 0,
@@ -470,7 +479,7 @@ for (const faults of FAULTS) {
         }
         for (let seed = firstSeed; seed < firstSeed + RUNS; seed++) {
           if (only !== undefined && seed !== only) continue
-          const failure = await runOnce(t, seed, mode, order, faults, stats)
+          const failure = await runOnce(t, seed, stale, order, faults, stats)
           if (failure) assert.fail(failure)
         }
         if (only !== undefined) return

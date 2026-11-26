@@ -62,14 +62,8 @@ redis.call("UNLINK", KEYS[2])
 return "1"
 `
 
-export function isCooldownMarker(value: Buffer): boolean {
+export function isCooldownMarker(value: Buffer) {
   return value.equals(COOLDOWN_MARKER_BUFFER)
-}
-
-export interface LockRenewal {
-  // True once a renewal sees the lock gone while the fetch is still active.
-  readonly lost: boolean
-  stop(): void
 }
 
 export interface RedisWriteEntry {
@@ -80,7 +74,7 @@ export interface RedisWriteEntry {
 
 type LuaFlag = '0' | '1'
 
-export interface SwrRedisCommands {
+interface SwrRedisCommands {
   swrAcquireLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<AcquireOutcome>
   swrCooldownLock: (lockKey: string, token: string, cooldownMs: number) => Promise<LuaFlag>
   swrExtendLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<LuaFlag>
@@ -130,7 +124,7 @@ export class RedisLock {
     this.key = key
   }
 
-  async acquire(ttlMs: number): Promise<AcquireOutcome> {
+  async acquire(ttlMs: number) {
     return this.redis.swrAcquireLock(this.key, this.token, ttlMs)
   }
 
@@ -138,7 +132,7 @@ export class RedisLock {
   startRenewal(
     lockTtlMs: number,
     callbacks: { onRenewError(err: unknown): void; onLockLost(): void },
-  ): LockRenewal {
+  ) {
     let state: 'active' | 'stopped' | 'lost' = 'active'
     let renewing = false
     const timer = setInterval(
@@ -166,6 +160,7 @@ export class RedisLock {
     timer.unref()
 
     return {
+      // True once a renewal sees the lock gone while the fetch is still active.
       get lost() {
         return state === 'lost'
       },
@@ -177,11 +172,11 @@ export class RedisLock {
   }
 
   // Swaps this owner's token for the cooldown marker; returns false if the lock is gone.
-  async cooldown(cooldownMs: number): Promise<boolean> {
+  async cooldown(cooldownMs: number) {
     return (await this.redis.swrCooldownLock(this.key, this.token, cooldownMs)) === '1'
   }
 
-  async commit(entries: readonly RedisWriteEntry[]): Promise<boolean> {
+  async commit(entries: readonly RedisWriteEntry[]) {
     const args: (string | Buffer | number)[] = [this.key]
     for (const entry of entries) args.push(entry.dataKey)
     args.push(this.token)
@@ -189,7 +184,7 @@ export class RedisLock {
     return (await this.redis.swrCommitAndRelease(1 + entries.length, args)) === '1'
   }
 
-  async release(): Promise<boolean> {
+  async release() {
     return (await this.redis.swrReleaseLock(this.key, this.token)) === '1'
   }
 }

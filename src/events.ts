@@ -72,7 +72,7 @@ export function reportRedisError(
   err: unknown,
   strategy: SwrFailureStrategy,
   emit: Emit | undefined,
-): SwrRedisError | undefined {
+) {
   if (strategy === 'protect-source') {
     emit?.(errorEvent('redis_error', keys[0], { keys, err }))
     return new SwrRedisError(keys, err)

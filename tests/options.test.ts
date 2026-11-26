@@ -1,6 +1,11 @@
 import { decodeEnvelope } from './helpers/envelope.ts'
 import { createRedisKeys } from '../src/keys.ts'
-import { DEFAULTS, MAX_TIMER_MS } from '../src/options.ts'
+import {
+  DEFAULTS,
+  MAX_TIMER_MS,
+  resolveCacheOptions,
+  resolveClientOptions,
+} from '../src/options.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createSwrClient, SwrValidationError } from '../src/index.ts'
@@ -288,4 +293,48 @@ test('Options inheritance: numeric client TTL and per-cache dynamic override set
     assert.equal(stored.freshUntilMs, freshUntilMs)
     assert.equal(stored.expiresAtMs, freshUntilMs)
   }
+})
+
+test('Options validation: a per-call staleWait is validated even when memory would serve the call', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  const cache = createSwrClient({ redis, memory: true }).cache({
+    key: 'per-call',
+    fetch: async () => 'value',
+  })
+  assert.equal(await cache.get(), 'value')
+  for (const staleWait of [-1, NaN, -Infinity, MAX_TIMER_MS / 1000 + 0.001]) {
+    await assert.rejects(
+      cache.get(undefined, { staleWait }),
+      (err: unknown) => err instanceof SwrValidationError && err.message.includes('staleWait'),
+      `staleWait=${staleWait}`,
+    )
+  }
+  for (const staleWait of [0, 0.5, Infinity]) {
+    assert.equal(await cache.get(undefined, { staleWait }), 'value')
+  }
+})
+
+test('Options inheritance: timing fields merge independently, and zero disables staleWait and failureCooldown', () => {
+  const client = resolveClientOptions({ fetchTimeout: 5, staleWait: 0.25, failureCooldown: 0 })
+  const cache = resolveCacheOptions(client, {
+    key: 'k',
+    fetch: async () => 'v',
+    staleWait: 0,
+    lockTtl: 0.5,
+  })
+  assert.equal(cache.fetchTimeoutMs, 5000)
+  assert.equal(cache.staleWaitMs, 0)
+  assert.equal(cache.failureCooldownMs, 0)
+  assert.equal(cache.lockTtlMs, 500)
+
+  const defaults = resolveCacheOptions(resolveClientOptions({}), {
+    key: 'k',
+    fetch: async () => 'v',
+    staleWait: Infinity,
+  })
+  assert.equal(defaults.fetchTimeoutMs, DEFAULTS.fetchTimeout * 1000)
+  assert.equal(defaults.staleWaitMs, Infinity)
+  assert.equal(defaults.failureCooldownMs, DEFAULTS.failureCooldown * 1000)
+  assert.equal(defaults.lockTtlMs, DEFAULTS.lockTtl * 1000)
 })

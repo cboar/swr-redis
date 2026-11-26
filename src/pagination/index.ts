@@ -1,12 +1,11 @@
 import { SwrValidationError } from '../errors.ts'
 import { isNonNegativeSafeInteger, isPositiveSafeInteger } from '../options.ts'
 import type {
-  SwrCacheWrite,
-  SwrFetchMeta,
   SwrCache,
+  SwrCacheOptions,
+  SwrCacheWrite,
   SwrClient,
-  SwrCodec,
-  SwrSharedOptions,
+  SwrFetchMeta,
   SwrTtlOption,
 } from '../types.ts'
 import { SwrNoCache, SwrWriteBatch } from '../wrappers.ts'
@@ -20,17 +19,14 @@ export interface SwrPaginatedPage<TItem> {
 
 export type SwrPaginationData<TItem> = { docs: TItem[]; totalDocs?: number } | TItem[]
 
-export type SwrPaginationFetchResult<TItem> =
-  SwrPaginationData<TItem> | SwrNoCache<SwrPaginationData<TItem>>
-
 export interface SwrPaginationRange {
   skip: number
   limit: number
 }
 
 export interface SwrPaginatedCacheOptions<TItem = unknown, Context = void> extends Omit<
-  SwrSharedOptions,
-  'ttl'
+  SwrCacheOptions<SwrPaginatedPage<TItem>, Context>,
+  'key' | 'fetch'
 > {
   /** Use `pageIndex` and `pageSize` (not `context`) so prefetched pages get distinct keys. */
   key: (context: Context, pageIndex: number, pageSize: number) => string
@@ -38,7 +34,7 @@ export interface SwrPaginatedCacheOptions<TItem = unknown, Context = void> exten
     context: Context,
     range: SwrPaginationRange,
     meta: SwrFetchMeta<Context>,
-  ) => Promise<SwrPaginationFetchResult<TItem>>
+  ) => Promise<SwrPaginationData<TItem> | SwrNoCache<SwrPaginationData<TItem>>>
   /** Pure function returning the 0-based page index (runs for key building and inside `fetch`). */
   pageIndex: (context: Context) => number
   /** Positive safe integer, or a pure function (runs for key building and inside `fetch`). */
@@ -47,12 +43,9 @@ export interface SwrPaginatedCacheOptions<TItem = unknown, Context = void> exten
   prefetchPages?: number
   /** Resolved once for the requested page and shared by prefetched pages. */
   ttl?: SwrTtlOption<NoInfer<SwrPaginatedPage<TItem>>, NoInfer<Context>>
-  memory?: false
-  name?: string
-  codec?: SwrCodec<SwrPaginatedPage<TItem>>
 }
 
-function computePageLimit(pageSize: number, prefetchPages: number): number {
+function computePageLimit(pageSize: number, prefetchPages: number) {
   const totalPages = 1 + prefetchPages
   const limit = pageSize * totalPages
   if (!Number.isSafeInteger(totalPages) || !Number.isSafeInteger(limit)) {
@@ -66,7 +59,7 @@ function computePaginationRange(
   pageSize: number,
   prefetchPages: number,
   limitOverride?: number,
-): SwrPaginationRange {
+) {
   const skip = pageIndex * pageSize
   if (!Number.isSafeInteger(skip)) {
     throw new SwrValidationError('pageIndex * pageSize exceeds maximum safe integer')
@@ -78,7 +71,7 @@ function computePaginationRange(
   return { skip, limit }
 }
 
-function extractDocs<TItem>(data: SwrPaginationData<TItem>): { docs: TItem[]; totalDocs?: number } {
+function extractDocs<TItem>(data: SwrPaginationData<TItem>) {
   if (Array.isArray(data)) return { docs: data }
   return { docs: data.docs, totalDocs: data.totalDocs }
 }
@@ -89,7 +82,7 @@ function buildPage<TItem>(
   pageIndex: number,
   pageSize: number,
   totalDocs: number | undefined,
-): SwrPaginatedPage<TItem> {
+) {
   return {
     docs: docs.slice(offset, offset + pageSize),
     pageIndex,
@@ -123,7 +116,7 @@ export function createSwrPaginatedCache<TItem = unknown, Context = void>(
   const staticLimit =
     typeof rawPageSize === 'number' ? computePageLimit(rawPageSize, prefetchPages) : undefined
 
-  const resolveParams = (context: Context): { pageIndex: number; pageSize: number } => {
+  const resolveParams = (context: Context) => {
     const pageIndex = getPageIndex(context)
     if (!isNonNegativeSafeInteger(pageIndex)) {
       throw new SwrValidationError('pageIndex must be a non-negative safe integer')
@@ -139,7 +132,7 @@ export function createSwrPaginatedCache<TItem = unknown, Context = void>(
     return { pageIndex, pageSize }
   }
 
-  const key = (context: Context): string => {
+  const key = (context: Context) => {
     const { pageIndex, pageSize } = resolveParams(context)
     return keyFn(context, pageIndex, pageSize)
   }

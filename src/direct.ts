@@ -1,9 +1,4 @@
-import {
-  awaitWithin,
-  type BoundedFetch,
-  type BoundedFetchResult,
-  type FetchFailure,
-} from './timing.ts'
+import { awaitWithin, type BoundedFetch, type FetchFailure } from './timing.ts'
 
 interface Entry<T> {
   readonly fetch: BoundedFetch<T>
@@ -21,11 +16,7 @@ export class DirectFetches<T> {
   }
 
   // Joins an active fetch or starts one; rejects only when signal aborts first.
-  async run(
-    key: string,
-    signal: AbortSignal | undefined,
-    start: () => BoundedFetch<T>,
-  ): Promise<BoundedFetchResult<T>> {
+  async run(key: string, signal: AbortSignal | undefined, start: () => BoundedFetch<T>) {
     const entry = this.inFlight.get(key) ?? this.open(key, start)
     entry.callers++
     try {
@@ -40,7 +31,7 @@ export class DirectFetches<T> {
     }
   }
 
-  private open(key: string, start: () => BoundedFetch<T>): Entry<T> {
+  private open(key: string, start: () => BoundedFetch<T>) {
     const entry: Entry<T> = { fetch: start(), callers: 0 }
     this.inFlight.set(key, entry)
     void entry.fetch.result.then((outcome) => {
@@ -52,7 +43,7 @@ export class DirectFetches<T> {
   }
 
   // A fetch that settles late removes only its own entry, never a replacement.
-  private remove(key: string, entry: Entry<T>): void {
+  private remove(key: string, entry: Entry<T>) {
     if (this.inFlight.get(key) === entry) this.inFlight.delete(key)
   }
 }

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createSwrClient, SwrNoCache, SwrValidationError } from '../src/index.ts'
 import { createRedisKeys } from '../src/keys.ts'
+import { COOLDOWN_MARKER } from '../src/lock.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { decodeEnvelope, encodeEnvelope } from './helpers/envelope.ts'
@@ -183,9 +184,9 @@ test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional dead
   assert.equal(calls, 1)
   redis.advanceTime(1)
   assert.ok(await redis.getBuffer(toDataKey('hard-cutoff')))
-  // A stale hit would return null in 'swr' mode; a cold miss surfaces the fetch failure.
+  // A stale hit would return null with the default staleWait 0; a cold miss surfaces the failure.
   await assert.rejects(cache.get(), (error) => error === failure)
-  assert.equal(await redis.get(toLockKey('hard-cutoff')), 'cooldown')
+  assert.equal(await redis.get(toLockKey('hard-cutoff')), COOLDOWN_MARKER)
 })
 
 for (const phase of ['cold', 'stale', 'set'] as const) {
@@ -222,7 +223,9 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
         `ttl=${String(invalid)}`,
       )
       assert.deepEqual(await redis.getBuffer(toDataKey('invalid-ttl')), before)
-      assert.equal(await redis.get(toLockKey('invalid-ttl')), phase === 'set' ? null : 'cooldown')
+      // A failure after the fetch still cools the key down.
+      const lock = phase === 'set' ? null : COOLDOWN_MARKER
+      assert.equal(await redis.get(toLockKey('invalid-ttl')), lock)
       if (phase === 'set') {
         assert.equal(await cache.get(), 'existing')
         assert.equal(await cache.get(undefined, { memory: false }), 'existing')
@@ -258,12 +261,13 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
         (error) => error === failure,
       )
     assert.deepEqual(await redis.getBuffer(toDataKey('throw-ttl')), before)
-    assert.equal(await redis.get(toLockKey('throw-ttl')), phase === 'set' ? null : 'cooldown')
+    const lock = phase === 'set' ? null : COOLDOWN_MARKER
+    assert.equal(await redis.get(toLockKey('throw-ttl')), lock)
     if (phase === 'set') assert.equal(await cache.get(), 'existing')
   })
 }
 
-// In 'swr' mode a stale read returns the stored value and refreshes in the background,
+// With the default staleWait 0 a stale read returns the stored value and refreshes in the background,
 // so fresh, stale, and expired reads are distinguishable by result and fetch count.
 for (const { name, now, expected, fetches } of [
   { name: 'before freshness boundary', now: 1999, expected: 'writer', fetches: 0 },
