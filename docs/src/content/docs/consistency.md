@@ -1,69 +1,106 @@
 ---
 title: Consistency and failure handling
-description: Choose a revalidation mode, wire background refresh lifecycles, handle Redis failures, and avoid stale writes after mutations.
+description: Configure stale handling, timeouts, serverless lifecycles, Redis failure strategies, and write ordering.
 ---
 
-A Redis lock coordinates fetches for each key. Concurrent callers can reuse a
-stale value or wait for a refresh, depending on the mode.
+A Redis lock coordinates fetches for each key. On a miss, one caller fetches
+while others wait. When an entry is stale (past `ttl`, before
+`ttl * staleMultiplier`), `staleWait` and `runtime` control whether callers wait
+for fresh data or return stale immediately.
 
-## Revalidation modes
+## Stale handling
 
-Set `mode` on the client or per cache to choose what callers receive when an
-entry is stale (past `ttl`, before `ttl * staleMultiplier`):
-
-| `mode` | Lock winner | Other callers | Best for |
+| Settings | Lock winner | Other callers | Best for |
 | --- | --- | --- | --- |
-| `'swr'` (default) | Returns stale and starts a background refresh. | Return stale. | Lowest latency when background work can outlive the response. |
-| `'swr-serverless'` | Refreshes inline and returns the fresh value. | Return stale. | Serverless runtimes without `waitUntil`, or bounded in-request refreshes. |
-| `'wait-on-stale'` | Refreshes inline and returns the fresh value. | Wait up to `waitTimeout` for the fresh value, then return stale. | Stricter freshness where brief latency is preferable to stale data. |
+| Defaults (`staleWait: 0`, `runtime: 'server'`) | Returns stale immediately; refreshes in background. | Return stale immediately. | Lowest latency on long-lived servers. |
+| `staleWait: 0.5` | Waits up to `0.5s`, then returns stale; refresh continues. | Wait up to `0.5s`, then return stale. | Stricter freshness with a bounded wait. |
+| `runtime: 'serverless'` (no `waitUntil`) | Refreshes inline (ignores `staleWait`). | Return stale (or wait up to `staleWait`). | Serverless runtimes without a keep-alive hook. |
+| `runtime: 'serverless'` + `waitUntil` | Waits up to `staleWait`; hook keeps refresh alive. | Wait up to `staleWait`. | Serverless with a keep-alive hook. |
 
-On a miss, one caller fetches while others wait for the result. Pass a
-`signal` to `get()` to cancel waiting and let your fetcher cancel its work.
-Background refreshes run independently of the caller's signal.
+`staleWait` can be set on the client, per cache, or per `get()` call. For
+example, a detail route can pass `staleWait: 0.2` while a listing route sharing
+the same cache passes `staleWait: 0`.
 
-Inline refreshes fall back to the stale value if the fetch fails before the
-stale entry expires. Use
-[`isFatal`](/swr-redis/observability/#mark-fatal-fetch-errors) for errors
-that should reach the caller.
+If an attached refresh fails or hits `fetchTimeout` before the stale entry
+expires, the caller receives the stale value. Use
+[`isFatal`](/swr-redis/observability/#mark-fatal-fetch-errors) for errors that
+should reach the waiting winner instead.
+
+In serverless runtimes without a `waitUntil` hook, the lock winner waits for its
+full refresh (up to `fetchTimeout`) even when holding stale data. Provide a
+`waitUntil` hook or size `fetchTimeout` to what the request can afford.
+
+## Timeouts, cancellation, and cooldowns
+
+- **Source limit (`fetchTimeout`).** Every source call, including background
+  refreshes, is bounded by `fetchTimeout` (default `30s`). On expiry,
+  `meta.signal` aborts and late results are discarded. Waiters also poll for at
+  most `fetchTimeout`. Without a usable stale value, callers receive
+  `SwrTimeoutError` (`phase: 'fetch'` or `'wait'`).
+- **Caller deadlines (`signal`).** Pass `signal: AbortSignal.timeout(ms)` to
+  `get()` to bound a request's wait (a cold call without a signal can wait up to
+  `fetchTimeout` and then take over a crashed fetcher's lock for another
+  `fetchTimeout`). Aborting rejects with `signal.reason` (never serves stale)
+  and detaches the caller without aborting the shared fetch, so the cache still
+  fills. Cancellation is checked between Redis commands; set
+  [`commandTimeout`](/swr-redis/configuration/#set-ioredis-command-timeouts) on
+  `ioredis` to bound stalled Redis calls.
+- **Failure cooldown (`failureCooldown`).** When a shared fetch fails or times
+  out, the key rests for `failureCooldown` (default `1s`) so a failing source
+  sees roughly one attempt per cooldown per key across all processes. Waiting
+  callers holding stale data return it immediately; cold waiters keep polling
+  until the cooldown expires. `set()` and `invalidate()` clear any active
+  cooldown.
 
 ## Background refresh lifecycle
 
-In `'swr'` mode, a refresh can outlive the request. Pass `waitUntil` in
-serverless runtimes, or call `flush()` before closing Redis on shutdown.
+When a refresh can outlive the request, pass `waitUntil` in serverless runtimes
+or call `flush()` before closing Redis on shutdown.
 
 ```ts
-// Serverless global hook (e.g. Vercel waitUntil or Next.js after)
-const swr = createSwrClient({ redis, prefix: 'my-app:prod', waitUntil })
+// AWS Lambda (no keep-alive hook): refreshing caller waits inline, bounded by fetchTimeout
+const lambdaSwr = createSwrClient({ redis, runtime: 'serverless', fetchTimeout: 7 })
 
-// Or per-request hook (e.g. Cloudflare Workers ctx.waitUntil) — overrides client waitUntil
+// Vercel / Next.js: global hook keeps refreshes alive after the response
+const vercelSwr = createSwrClient({ redis, runtime: 'serverless', waitUntil })
+
+// Cloudflare Workers: per-request hook (routes that omit it refresh inline)
+const workerSwr = createSwrClient({ redis, runtime: 'serverless' })
 const user = await userCache.get('u_123', {
   waitUntil: (promise) => ctx.waitUntil(promise),
 })
 
-// Long-running servers: wait for in-flight refreshes before closing Redis on shutdown
+// Long-running servers: stop accepting requests, drain refreshes, then close Redis
 await swr.flush()
 await redis.quit()
 ```
 
+Without a `waitUntil` hook in serverless, work left behind after a caller's
+`signal` aborts may freeze once the response is sent; its lock expires after
+`lockTtl` so the next caller retries.
+
 ## Failure strategies
 
 Set `failureStrategy` on the client or per cache to choose how `swr-redis`
-behaves when Redis fails or a wait exceeds `waitTimeout` and no stale value can
-be served:
+behaves when Redis fails and no stale value can be served:
 
 - **`'availability'`** (default) fetches directly from the source without
-  caching the result. Failed explicit cache writes and invalidations are
-  reported through `onEvent`.
-- **`'protect-source'`** rejects the request, as well as failed explicit cache
-  writes and invalidations. See [typed errors](/swr-redis/observability/#errors).
+  caching the result, sharing one in-flight fetch per key within each cache
+  instance (aborted if every attached caller leaves). Failed explicit writes and
+  invalidations are reported through `onEvent`.
+- **`'protect-source'`** rejects with `SwrRedisError`, as well as rejecting
+  failed explicit writes and invalidations. See
+  [typed errors](/swr-redis/observability/#errors).
 
-Under either strategy, if a refresh or wait fails, an unexpired stale value can
-still be returned. The `stale_fallback` warning reports the failure. If the
-value expires during an inline refresh and the fetch fails, the caller receives
-the fetch error. If the value expires while waiting, the caller proceeds as it
-would on a cache miss. Cancellation and
-[fatal inline fetch errors](/swr-redis/observability/#mark-fatal-fetch-errors)
-still reject the request.
+Waiting timeouts while Redis is healthy never fall back to direct fetches under
+either strategy. Callers receive stale data if available, or `SwrTimeoutError`.
+Under either strategy, if a refresh or wait fails, an unexpired stale value is
+returned (emitting `stale_fallback`, or `timeout` when a refresh hits
+`fetchTimeout`; a wait that times out and returns stale emits neither). If the
+value expires mid-wait or mid-refresh, the call falls back to the cold-miss or
+error path. Cancellation and
+[fatal fetch errors](/swr-redis/observability/#mark-fatal-fetch-errors) still
+reject the caller.
 
 If a successfully prepared fetch result fails to reach Redis, the caller still
 receives the fetched value and `onEvent` reports the failure.

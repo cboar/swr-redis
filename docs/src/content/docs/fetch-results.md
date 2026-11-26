@@ -16,7 +16,7 @@ The second argument to `fetch` is `SwrFetchMeta<Context>`:
 | Field | Description |
 | --- | --- |
 | `key` | The cache's `cache.key` function. |
-| `signal` | The caller's `AbortSignal`, or `undefined` during background `'swr'` refreshes. |
+| `signal` | Library-owned `AbortSignal`: aborts on `fetchTimeout`, or for a fallback fetch once every waiting caller leaves. Never the caller's signal. |
 | `cacheWrite` | `'attempt'` for normal fetches, or `'skip'` during a [fallback fetch](/swr-redis/consistency/#failure-strategies) that writes nothing. |
 
 `'attempt'` does not guarantee the write will land (for instance, if the lock is
@@ -48,9 +48,9 @@ const profileCache = swr.cache<Profile | null, string>({
 ```
 
 Nothing is written to Redis or memory, existing entries are left untouched, the
-`ttl` callback does not run, and no `refresh` event is emitted. In background
-`'swr'` refreshes, the caller already received the stale value, so the
-`SwrNoCache` result is discarded.
+lock is released without a cooldown, the `ttl` callback does not run, and no
+`refresh` event is emitted. If the caller already detached and returned a stale
+value, the `SwrNoCache` result is discarded.
 
 ## Write related keys with `SwrWriteBatch`
 

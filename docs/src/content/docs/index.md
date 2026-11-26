@@ -94,15 +94,18 @@ const settings = await settingsCache.get()
 
 ## Read cached values
 
-`get` returns a fresh cached value, handles stale entries according to `mode`,
-or fetches on a miss while concurrent callers wait. Pass a `signal` to stop
-waiting:
+`get` returns a fresh cached value, serves stale entries while refreshing (or
+waits up to `staleWait`), or fetches on a miss while concurrent callers wait.
+Pass a `signal` to bound how long a call waits:
 
 ```ts
 const user = await userCache.get('u_123', {
   signal: AbortSignal.timeout(2_500),
 })
 ```
+
+A caller's `signal` cancels only that call; the shared fetch keeps running to
+fill the cache.
 
 Use `getWithMeta()` when you need per-call metadata alongside the value. It
 returns `value`, `source`, and an optional `timing` object.
@@ -152,9 +155,10 @@ await swr.invalidateKeys(userCache.key('u_123'), userCache.key('u_456'))
 - **Update the source before the cache.** A concurrent read that started before
   your `set` or `invalidate` can still fetch and write what it reads. See
   [write ordering](/swr-redis/consistency/#write-ordering).
-- **Wire background refresh lifecycles.** Under the default `'swr'` mode, pass
-  `waitUntil` in serverless runtimes and call `await swr.flush()` before process
-  shutdown. See
+- **Configure serverless runtimes and shutdown.** In serverless runtimes, set
+  `runtime: 'serverless'` or pass `waitUntil` so refreshes aren't frozen after
+  the response. On long-lived servers, call `await swr.flush()` before closing
+  Redis. See
   [background refresh lifecycle](/swr-redis/consistency/#background-refresh-lifecycle).
 - **Memory caching is per process.** When `memory` is enabled, invalidations in
   one process do not notify other processes. See
@@ -168,7 +172,7 @@ await swr.invalidateKeys(userCache.key('u_123'), userCache.key('u_456'))
   write related keys together.
 - [Pagination](/swr-redis/pagination/) — cache offset-paginated queries
   and prefetch following pages.
-- [Consistency and failures](/swr-redis/consistency/) — revalidation
-  modes, failure strategies, and write ordering.
+- [Consistency and failures](/swr-redis/consistency/) — stale handling,
+  timeouts, failure strategies, and write ordering.
 - [Observability and errors](/swr-redis/observability/) — `onEvent`
   telemetry and typed errors.

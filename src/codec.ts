@@ -10,7 +10,7 @@ export interface Envelope<T> {
 
 type EnvelopeHeader = ReturnType<typeof readEnvelopeHeader>
 
-// Envelope layout in DECISIONS.md.
+// Header: 1 flag byte + three big-endian float64 timestamps (cachedAtMs, freshUntilMs, expiresAtMs).
 export const ENVELOPE_HEADER_SIZE = 25
 const FLAG_DEFLATED = 0x01
 
