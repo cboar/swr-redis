@@ -43,7 +43,7 @@ if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return "0"
 end
 for i = 2, #KEYS do
-  redis.call("SET", KEYS[i], ARGV[2 * i - 2], "EX", ARGV[2 * i - 1])
+  redis.call("SET", KEYS[i], ARGV[2 * i - 2], "PX", ARGV[2 * i - 1])
 end
 redis.call("UNLINK", KEYS[1])
 return "1"
@@ -57,7 +57,7 @@ return "0"
 `
 
 export const SET_AND_CLEAR_LOCK_SCRIPT = `
-redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
 redis.call("UNLINK", KEYS[2])
 return "1"
 `
@@ -69,7 +69,7 @@ export function isCooldownMarker(value: Buffer) {
 export interface RedisWriteEntry {
   readonly dataKey: string
   readonly buffer: Buffer
-  readonly ttlSeconds: number
+  readonly ttlMs: number
 }
 
 type LuaFlag = '0' | '1'
@@ -87,7 +87,7 @@ interface SwrRedisCommands {
     dataKey: string,
     lockKey: string,
     buffer: Buffer,
-    ttlSeconds: number,
+    ttlMs: number,
   ) => Promise<LuaFlag>
 }
 
@@ -180,7 +180,7 @@ export class RedisLock {
     const args: (string | Buffer | number)[] = [this.key]
     for (const entry of entries) args.push(entry.dataKey)
     args.push(this.token)
-    for (const entry of entries) args.push(entry.buffer, entry.ttlSeconds)
+    for (const entry of entries) args.push(entry.buffer, entry.ttlMs)
     return (await this.redis.swrCommitAndRelease(1 + entries.length, args)) === '1'
   }
 

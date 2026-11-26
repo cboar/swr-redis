@@ -16,7 +16,7 @@ import {
   requireTtl,
   resolveCacheOptions,
   resolveStaleWaitMs,
-  toRedisTtlSeconds,
+  toRedisTtlMs,
   type ResolvedCacheOptions,
 } from './options.ts'
 import { awaitWithin, pollDelayMs, sleep, startBoundedFetch, type FetchFailure } from './timing.ts'
@@ -174,7 +174,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     const { redis, keys, memory } = this.client
     const key = this.options.keyOf(context)
     const ttl = this.resolvePrimaryTtl(context, key, value)
-    const { envelope, buffer, ttlSeconds } = this.prepareWrite(
+    const { envelope, buffer, ttlMs } = this.prepareWrite(
       value,
       Date.now(),
       ttl,
@@ -184,7 +184,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
     const pending = memory.beginWrite([{ key, envelope }])
     try {
-      await redis.swrSetAndClearLock(keys.data(key), keys.lock(key), buffer, ttlSeconds)
+      await redis.swrSetAndClearLock(keys.data(key), keys.lock(key), buffer, ttlMs)
     } catch (err) {
       memory.settle(pending, 'evict')
       const redisError = this.reportRedisError(key, err)
@@ -640,7 +640,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     useMemory: boolean,
   ) {
     const { staleMultiplier, compression } = this.options
-    const ttlSeconds = toRedisTtlSeconds(ttl, staleMultiplier)
+    const ttlMs = toRedisTtlMs(ttl, staleMultiplier)
     // Freeze once so callers cannot mutate shared deadlines.
     const timing: SwrEntryTiming = Object.freeze({
       cachedAtMs,
@@ -648,10 +648,10 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       expiresAtMs: cachedAtMs + ttl * staleMultiplier * 1000,
     })
     const buffer = encodeEnvelope(value, timing, encoder, compression)
-    if (!useMemory) return { timing, buffer, ttlSeconds }
+    if (!useMemory) return { timing, buffer, ttlMs }
     // Clone before writing to Redis so uncloneable values fail before any Redis write.
     const memoryValue = this.client.memory.clones ? structuredClone(value) : value
-    return { timing, buffer, ttlSeconds, envelope: { value: memoryValue, timing } }
+    return { timing, buffer, ttlMs, envelope: { value: memoryValue, timing } }
   }
 
   private resolvePrimaryTtl(context: Context, key: string, value: T) {

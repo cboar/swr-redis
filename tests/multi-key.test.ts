@@ -128,7 +128,8 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
   assert.equal(await redis.pttl(toDataKey('dyn:primary')), 3000)
   assert.equal(await redis.pttl(toDataKey('dyn:inherit')), 3000)
   assert.equal(await redis.pttl(toDataKey('dyn:long')), 30_000)
-  assert.equal(await redis.pttl(toDataKey('dyn:short')), 1000)
+  // 0.2 * 3 * 1000 is 600.0000000000001 in floating point; ceil keeps Redis expiry at or after the header.
+  assert.equal(await redis.pttl(toDataKey('dyn:short')), 601)
 
   // 2. Batch TTL overrides configured TTL without invoking callback and supplies secondary default
   const overrideCache = swr.cache({

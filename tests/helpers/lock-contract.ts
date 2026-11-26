@@ -57,7 +57,7 @@ export function lockContract(
     assert.equal(await lock.acquire(10000), 'acquired')
 
     const buf = Buffer.from('payload-a')
-    const result = await lock.commit([{ dataKey: 'dataset:1:a', buffer: buf, ttlSeconds: 120 }])
+    const result = await lock.commit([{ dataKey: 'dataset:1:a', buffer: buf, ttlMs: 120_000 }])
 
     assert.equal(result, true)
     assert.equal(await redis.get(lock.key), null)
@@ -69,7 +69,7 @@ export function lockContract(
   })
 
   contract(
-    'COMMIT_AND_RELEASE_SCRIPT: overwrites secondary entries with per-entry EX',
+    'COMMIT_AND_RELEASE_SCRIPT: overwrites secondary entries with per-entry PX',
     async (t) => {
       const raw = await createRedis(t)
       if (!raw) return
@@ -83,9 +83,9 @@ export function lockContract(
       const replacementBuf = Buffer.from('replacement-payload')
       const absentBuf = Buffer.from('absent-payload')
       const result = await lock.commit([
-        { dataKey: 'dataset:warm:primary', buffer: primaryBuf, ttlSeconds: 120 },
-        { dataKey: 'dataset:warm:existing', buffer: replacementBuf, ttlSeconds: 45 },
-        { dataKey: 'dataset:warm:absent', buffer: absentBuf, ttlSeconds: 180 },
+        { dataKey: 'dataset:warm:primary', buffer: primaryBuf, ttlMs: 120_000 },
+        { dataKey: 'dataset:warm:existing', buffer: replacementBuf, ttlMs: 45_000 },
+        { dataKey: 'dataset:warm:absent', buffer: absentBuf, ttlMs: 180_000 },
       ])
 
       assert.equal(result, true)
@@ -111,11 +111,11 @@ export function lockContract(
       await owner.acquire(5000)
 
       const result = await stale.commit([
-        { dataKey: 'dataset:2', buffer: Buffer.from('should-not-be-written'), ttlSeconds: 60 },
+        { dataKey: 'dataset:2', buffer: Buffer.from('should-not-be-written'), ttlMs: 60_000 },
         {
           dataKey: 'dataset:2:warm',
           buffer: Buffer.from('warm-should-not-be-written'),
-          ttlSeconds: 30,
+          ttlMs: 30_000,
         },
       ])
 
@@ -136,7 +136,7 @@ export function lockContract(
 
       assert.equal(await lock.acquire(10000), 'acquired')
 
-      // Omit the second secondary's EX so Redis errors mid-script after writing primary and secondary 0.
+      // Omit the second secondary's PX so Redis errors mid-script after writing primary and secondary 0.
       await assert.rejects(() =>
         redis.swrCommitAndRelease(4, [
           lock.key,
@@ -145,10 +145,10 @@ export function lockContract(
           'dataset:err:bad',
           lock.token,
           Buffer.from('primary-ok'),
-          120,
+          120_000,
           Buffer.from('warm-ok'),
-          60,
-          Buffer.from('warm-missing-ex'),
+          60_000,
+          Buffer.from('warm-missing-px'),
         ]),
       )
 
@@ -270,14 +270,15 @@ export function lockContract(
       await owner.acquire(5000)
 
       const buf = Buffer.from('primed-value')
-      await redis.swrSetAndClearLock('data:k1', 'lock:k1', buf, 60)
+      await redis.swrSetAndClearLock('data:k1', 'lock:k1', buf, 1_500)
 
       assert.deepEqual(await redis.getBuffer('data:k1'), buf)
+      await assertTtl(redis, 'data:k1', 1_500)
       assert.equal(await redis.get('lock:k1'), null)
 
       await owner.acquire(5000)
       await owner.cooldown(5000)
-      await redis.swrSetAndClearLock('data:k1', 'lock:k1', Buffer.from('fixed'), 60)
+      await redis.swrSetAndClearLock('data:k1', 'lock:k1', Buffer.from('fixed'), 60_000)
       assert.equal(await redis.get('lock:k1'), null)
       assert.equal(await new RedisLock(redis, 'lock:k1').acquire(5000), 'acquired')
     },

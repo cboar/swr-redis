@@ -32,8 +32,6 @@ export const DEFAULTS = {
 export const MAX_TIMER_MS = 2_147_483_647
 export const POLL_JITTER = 0.3
 
-const MAX_REDIS_TTL_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
-
 export interface ResolvedClientOptions {
   readonly prefix: string
   readonly runtime: SwrRuntime
@@ -80,7 +78,7 @@ export function resolveClientOptions(
   requireNonEmpty(prefix, 'prefix')
   validateFields(shared)
   // A cache may still complete these fields, so only check what the client sets.
-  if (shared.ttl !== undefined) toRedisTtlSeconds(shared.ttl, shared.staleMultiplier ?? 1)
+  if (shared.ttl !== undefined) toRedisTtlMs(shared.ttl, shared.staleMultiplier ?? 1)
   return {
     prefix,
     runtime,
@@ -101,7 +99,7 @@ export function resolveCacheOptions<T, Context>(
   const ttl = cache.ttl ?? shared.ttl ?? DEFAULTS.ttl
   const staleMultiplier =
     cache.staleMultiplier ?? shared.staleMultiplier ?? DEFAULTS.staleMultiplier
-  if (typeof ttl === 'number') toRedisTtlSeconds(ttl, staleMultiplier)
+  if (typeof ttl === 'number') toRedisTtlMs(ttl, staleMultiplier)
 
   return {
     keyOf: resolveKey(cache.key),
@@ -231,12 +229,13 @@ export function requireTtl(ttl: number, label: string) {
   return ttl
 }
 
-export function toRedisTtlSeconds(ttl: number, staleMultiplier: number) {
-  const seconds = Math.max(1, Math.ceil(ttl * staleMultiplier))
-  if (!Number.isSafeInteger(seconds * 1000)) {
-    fail(`Resolved Redis ttl exceeds maximum supported duration (${MAX_REDIS_TTL_SECONDS}s)`)
+// Ceil so Redis never expires a key before its header's expiresAtMs.
+export function toRedisTtlMs(ttl: number, staleMultiplier: number) {
+  const ms = Math.ceil(ttl * staleMultiplier * 1000)
+  if (!Number.isSafeInteger(ms)) {
+    fail(`Resolved Redis ttl exceeds maximum supported duration (${Number.MAX_SAFE_INTEGER}ms)`)
   }
-  return seconds
+  return ms
 }
 
 function toMs(seconds: number) {

@@ -195,11 +195,11 @@ export class FakeRedis {
         for (let i = 1; i < keys.length; i++) {
           const dataKey = keys[i]!
           const value = argv[i * 2 - 1]
-          const ttlSeconds = argv[i * 2]
-          if (value === undefined || ttlSeconds === undefined) {
+          const ttlMs = argv[i * 2]
+          if (value === undefined || ttlMs === undefined) {
             throw new Error("ERR wrong number of arguments for 'set' command")
           }
-          this.storeValue(dataKey, value, 'EX', Number(ttlSeconds))
+          this.storeValue(dataKey, value, 'PX', Number(ttlMs))
         }
         this.removeKeys(lockKey)
         return '1'
@@ -209,8 +209,7 @@ export class FakeRedis {
         const dataKey = keys[0]!
         const lockKey = keys[1]!
         const buf = argv[0]
-        const ttlSeconds = Number(argv[1])
-        this.storeValue(dataKey, buf, 'EX', ttlSeconds)
+        this.storeValue(dataKey, buf, 'PX', Number(argv[1]))
         this.removeKeys(lockKey)
         return '1'
       }

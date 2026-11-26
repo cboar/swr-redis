@@ -55,7 +55,7 @@ test('RedisLock.startRenewal: renews the full lockTtl every 40% of it, without a
   await tick(t, redis, 40)
   assert.equal(ttls.length, 10)
   assert.equal(
-    await lock.commit([{ dataKey: 'data:heartbeat', buffer: Buffer.from('ok'), ttlSeconds: 60 }]),
+    await lock.commit([{ dataKey: 'data:heartbeat', buffer: Buffer.from('ok'), ttlMs: 60_000 }]),
     true,
   )
 })

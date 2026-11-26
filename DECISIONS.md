@@ -81,9 +81,11 @@ Envelopes carry a small header with their deadlines so readers can reject
 unusable entries before decoding the payload and honor the writer's deadlines
 even when processes are configured with different TTLs. Deadlines use wall-clock
 time, so clock skew between writers and readers affects how long entries appear
-fresh or usable. Any incompatible envelope change must bump the version in the
-Redis key namespace (`swr:v1` in `src/keys.ts`) so old and new formats do not
-collide.
+fresh or usable. Redis expiry uses a relative `PX`, not `PEXPIREAT`, so a
+lagging writer clock can't cut the stale window short; readers still check the
+header. Any incompatible envelope change
+must bump the version in the Redis key namespace (`swr:v1` in `src/keys.ts`) so
+old and new formats do not collide.
 
 ## Fallbacks avoid uncoordinated source load and writes
 
