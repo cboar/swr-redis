@@ -46,7 +46,8 @@ test(
     assert.equal(await observer.getBuffer(dataKey('order')), null)
     assert.equal(await observer.get(`${keyPrefix}${lockKey('order')}`), null)
     const nextTtl = await observer.ttl(`${keyPrefix}${dataKey('order:next')}`)
-    assert.ok(nextTtl > 290 && nextTtl <= 300, `Expected ~300s, got ${nextTtl}`)
+    // 60s fresh plus the primary's resolved stale window (30 * 4).
+    assert.ok(nextTtl > 170 && nextTtl <= 180, `Expected ~180s, got ${nextTtl}`)
 
     // A waiter polls the prefixed data and lock keys with one MGET and resolves on commit.
     await observer.set(`${keyPrefix}${lockKey('polled')}`, 'other-owner', 'PX', 5000)

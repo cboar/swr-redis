@@ -12,6 +12,15 @@ import {
 // Captured before any test mocks Date.now with this fake's own clock (see useRedisClock).
 const realNow = Date.now
 
+// Lua compares strings byte for byte; lock tokens are raw bytes.
+function toBuffer(value: unknown) {
+  return Buffer.isBuffer(value) ? value : Buffer.from(String(value))
+}
+
+function holds(entry: KeyEntry | null, token: unknown) {
+  return entry !== null && entry.value.equals(toBuffer(token))
+}
+
 interface KeyEntry {
   value: Buffer
   expiresAt: number | null
@@ -157,29 +166,27 @@ export class FakeRedis {
     switch (script) {
       case ACQUIRE_LOCK_SCRIPT: {
         const lockKey = keys[0]!
-        const token = String(argv[0])
-        const owner = this.cleanExpired(lockKey)?.value.toString('utf-8')
-        if (owner === COOLDOWN_MARKER) return 'cooldown'
-        if (owner !== undefined && owner !== token) return 'busy'
+        const token = toBuffer(argv[0])
+        const owner = this.cleanExpired(lockKey)
+        if (holds(owner, COOLDOWN_MARKER)) return 'cooldown'
+        if (owner && !holds(owner, token)) return 'busy'
         this.storeValue(lockKey, token, 'PX', argv[1])
         return 'acquired'
       }
 
       case COOLDOWN_LOCK_SCRIPT: {
         const lockKey = keys[0]!
-        const current = this.cleanExpired(lockKey)
-        if (!current || current.value.toString('utf-8') !== String(argv[0])) return '0'
+        if (!holds(this.cleanExpired(lockKey), argv[0])) return '0'
         this.storeValue(lockKey, COOLDOWN_MARKER, 'PX', argv[1])
         return '1'
       }
 
       case EXTEND_LOCK_SCRIPT: {
         const lockKey = keys[0]!
-        const token = String(argv[0])
         const lockTtlMs = Number(argv[1])
 
         const current = this.cleanExpired(lockKey)
-        if (!current || current.value.toString('utf-8') !== token) return '0'
+        if (!current || !holds(current, argv[0])) return '0'
         const currentPttl = current.expiresAt === null ? -1 : current.expiresAt - this.getTime()
         if (currentPttl >= lockTtlMs) return '1'
         return String(this.expireKey(lockKey, lockTtlMs))
@@ -187,10 +194,7 @@ export class FakeRedis {
 
       case COMMIT_AND_RELEASE_SCRIPT: {
         const lockKey = keys[0]!
-        const lockToken = String(argv[0])
-
-        const current = this.cleanExpired(lockKey)
-        if (!current || current.value.toString('utf-8') !== lockToken) return '0'
+        if (!holds(this.cleanExpired(lockKey), argv[0])) return '0'
 
         for (let i = 1; i < keys.length; i++) {
           const dataKey = keys[i]!
@@ -216,10 +220,7 @@ export class FakeRedis {
 
       case RELEASE_LOCK_SCRIPT: {
         const lockKey = keys[0]!
-        const lockToken = String(argv[0])
-
-        const current = this.cleanExpired(lockKey)
-        if (!current || current.value.toString('utf-8') !== lockToken) return '0'
+        if (!holds(this.cleanExpired(lockKey), argv[0])) return '0'
         this.removeKeys(lockKey)
         return '1'
       }

@@ -63,7 +63,7 @@ test('Redis keys: a data key cannot overwrite another cache entry’s active loc
 
 test('Redis keys: client prefixes isolate entries without delimiter collisions', async () => {
   const redis = createFakeRedis()
-  assert.equal(createRedisKeys('app').data('k'), 'swr:v1:YXBw:data:k')
+  assert.equal(createRedisKeys('app').data('k'), 'SWR2:D:YXBw:{k}')
   const pairs: readonly [string, string][] = [
     ['a', 'b:c'],
     ['a:b', 'c'],
@@ -83,7 +83,7 @@ for (const { value, ttl } of [
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
     const inputs: unknown[] = []
-    const cache = createSwrClient({ redis, staleMultiplier: 2 }).cache<string | null, string>({
+    const cache = createSwrClient({ redis, stale: ({ ttl }) => ttl }).cache<string | null, string>({
       key: (id) => `ttl:${id}`,
       fetch: async () => value,
       ttl: (input) => {
@@ -109,7 +109,7 @@ for (const { value, ttl } of [
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
     const inputs: unknown[] = []
-    const cache = createSwrClient({ redis, staleMultiplier: 2, memory: true }).cache<
+    const cache = createSwrClient({ redis, stale: ({ ttl }) => ttl, memory: true }).cache<
       string | null,
       string
     >({
@@ -139,7 +139,7 @@ test('TTL callback: stale refresh resolves its new value lifetime with static un
   const swr = createSwrClient({ redis })
   const cache = swr.cache<string | null>({
     key: 'static-ttl',
-    staleMultiplier: 3,
+    stale: ({ ttl }) => ttl * 2,
     fetch: async () => (++calls === 1 ? null : 'recovered'),
     ttl: (input) => {
       inputs.push(input)
@@ -149,7 +149,7 @@ test('TTL callback: stale refresh resolves its new value lifetime with static un
   assert.equal(await cache.get(), null)
   redis.advanceTime(300)
   assert.equal(await cache.get(), null)
-  await swr.flush()
+  await swr.drain()
   assert.equal(await cache.get(), 'recovered')
   assert.deepEqual(inputs, [
     { context: undefined, key: 'static-ttl', value: null },
@@ -163,7 +163,7 @@ test('TTL callback: stale refresh resolves its new value lifetime with static un
   })
 })
 
-test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional deadline while Redis still holds the key', async (t) => {
+test('stale: 0 hard cutoff is a cold miss at the exact fractional deadline while Redis still holds the key', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   let calls = 0
@@ -171,7 +171,7 @@ test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional dead
   const cache = createSwrClient({ redis }).cache({
     key: 'hard-cutoff',
     ttl: () => 0.25,
-    staleMultiplier: 1,
+    stale: 0,
     fetch: async () => {
       if (++calls > 1) throw failure
       return null
@@ -289,22 +289,22 @@ for (const { name, now, expected, fetches } of [
     const cache = swr.cache({
       key: 'writer-owned',
       ttl: () => assert.fail('reader TTL must not run'),
-      staleMultiplier: 20,
+      stale: ({ ttl }) => ttl * 19,
       fetch: async () => {
         calls++
         return new SwrNoCache('origin')
       },
     })
     assert.equal(await cache.get(), expected)
-    await swr.flush()
+    await swr.drain()
     assert.equal(calls, fetches)
   })
 }
 
-test('Oversized dynamic resolved Redis TTL (including staleMultiplier) throws SwrValidationError without mutating existing entry', async (t) => {
+test('Oversized dynamic resolved Redis TTL (including stale) throws SwrValidationError without mutating existing entry', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
-  const swr = createSwrClient({ redis, memory: true, staleMultiplier: 2 })
+  const swr = createSwrClient({ redis, memory: true, stale: ({ ttl }) => ttl })
   const seed = swr.cache({ key: 'oversized-ttl', ttl: 10, fetch: async () => 'existing' })
   await seed.set(undefined, 'existing')
   const before = await redis.getBuffer(toDataKey('oversized-ttl'))
@@ -323,7 +323,7 @@ test('getWithMeta reports source and timing across fetch, memory, Redis, and sta
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   let calls = 0
-  const swr = createSwrClient({ redis, memory: true, ttl: 2, staleMultiplier: 3 })
+  const swr = createSwrClient({ redis, memory: true, ttl: 2, stale: ({ ttl }) => ttl * 2 })
   const cache = swr.cache({ key: 'meta', fetch: async () => `v${++calls}` })
   const expectedTiming = { cachedAtMs: 1000, freshUntilMs: 3000, expiresAtMs: 7000 }
 
@@ -352,7 +352,7 @@ test('getWithMeta reports source and timing across fetch, memory, Redis, and sta
     source: 'redis',
     timing: expectedTiming,
   })
-  await swr.flush()
+  await swr.drain()
 })
 
 test('getWithMeta omits timing for uncached SwrNoCache and fallback fetches', async () => {
@@ -373,6 +373,6 @@ test('getWithMeta omits timing for uncached SwrNoCache and fallback fetches', as
   const fallback = swr.cache({ key: 'fallback', fetch: async () => 'direct' })
   assert.deepEqual(await fallback.getWithMeta(), {
     value: 'direct',
-    source: 'fetch',
+    source: 'direct',
   })
 })

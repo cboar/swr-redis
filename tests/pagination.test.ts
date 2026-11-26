@@ -76,7 +76,7 @@ test('createSwrPaginatedCache: rejects invalid dynamic pageIndex, pageSize, and 
     pageIndex: (ctx) => ctx.pageIndex,
     pageSize: (ctx) => ctx.pageSize,
     prefetchPages: 2,
-    key: (_ctx, page, size) => {
+    key: ({ pageIndex: page, pageSize: size }) => {
       keyCalls++
       return `p:${page}:s:${size}`
     },
@@ -148,7 +148,8 @@ test('createSwrPaginatedCache: pre-warms secondary pages and caps over-returning
     prefetchPages: 2,
     ttl: 30,
     pageIndex: (ctx: QueryCtx) => ctx.pageIndex,
-    key: (ctx, page, size) => `articles:${ctx.topic}:p${page}:s${size}`,
+    key: ({ context: ctx, pageIndex: page, pageSize: size }) =>
+      `articles:${ctx.topic}:p${page}:s${size}`,
     fetch: async (_ctx, { skip, limit }) => {
       dbQueries++
       return { docs: allArticles.slice(skip, skip + limit), totalDocs: allArticles.length }
@@ -178,7 +179,7 @@ test('createSwrPaginatedCache: pre-warms secondary pages and caps over-returning
     pageSize: 2,
     prefetchPages: 0,
     pageIndex: (ctx: { page: number }) => ctx.page,
-    key: (_ctx, page, size) => `noprefetch:p${page}:s${size}`,
+    key: ({ pageIndex: page, pageSize: size }) => `noprefetch:p${page}:s${size}`,
     fetch: async (_ctx, { skip }) => {
       zeroPrefetchQueries++
       // Deliberately returns 6 docs even though limit=2
@@ -192,7 +193,7 @@ test('createSwrPaginatedCache: pre-warms secondary pages and caps over-returning
   const p1 = await noPrefetch.get({ page: 1 })
   assert.deepEqual(p1, { docs: [2, 3], pageIndex: 1, pageSize: 2 })
   assert.equal(zeroPrefetchQueries, 2)
-  await swr.flush()
+  await swr.drain()
 })
 
 test('createSwrPaginatedCache: uses the source page size when computing prefetch keys', async () => {
@@ -202,7 +203,7 @@ test('createSwrPaginatedCache: uses the source page size when computing prefetch
     pageSize: (page) => (page === 1 ? 3 : 2),
     prefetchPages: 2,
     pageIndex: (page: number) => page,
-    key: (_ctx, page, size) => `variable:p${page}:s${size}`,
+    key: ({ pageIndex: page, pageSize: size }) => `variable:p${page}:s${size}`,
     fetch: async (page, { skip, limit }) => {
       fetched.push(page)
       return Array.from({ length: limit }, (_, i) => skip + i)
@@ -226,7 +227,7 @@ test('createSwrPaginatedCache: supports SwrNoCache without caching primary or pr
     pageSize: 2,
     prefetchPages: 2,
     pageIndex: (ctx: { page: number }) => ctx.page,
-    key: (_ctx, page) => {
+    key: ({ pageIndex: page }) => {
       keyCalls.push(page)
       return `nc-page:${page}`
     },
@@ -253,7 +254,7 @@ test('createSwrPaginatedCache: supports SwrNoCache without caching primary or pr
   assert.deepEqual(cached, { docs: [1, 2], pageIndex: 0, pageSize: 2, totalDocs: 10 })
   assert.equal(calls, 2)
   assert.equal(ttlCalls, 1)
-  await swr.flush()
+  await swr.drain()
 })
 
 test('createSwrPaginatedCache: uses limit=pageSize on availability fallback (cacheWrite: "skip")', async (t) => {
@@ -277,7 +278,7 @@ test('createSwrPaginatedCache: uses limit=pageSize on availability fallback (cac
     pageSize: 5,
     prefetchPages: 2,
     pageIndex: (ctx: QueryCtx) => ctx.pageIndex,
-    key: (ctx, page, size) => {
+    key: ({ context: ctx, pageIndex: page, pageSize: size }) => {
       keyPages.push(page)
       return `art:${ctx.topic}:p${page}:s${size}`
     },
@@ -326,7 +327,7 @@ test('createSwrPaginatedCache: uses limit=pageSize on availability fallback (cac
   } finally {
     redis.getBuffer = origGetBuffer
   }
-  await swr.flush()
+  await swr.drain()
 })
 
 test('createSwrPaginatedCache: single page codec round-trips primary and prefetched pages with one origin call', async (t) => {
@@ -346,7 +347,7 @@ test('createSwrPaginatedCache: single page codec round-trips primary and prefetc
     pageSize: 2,
     prefetchPages: 1,
     pageIndex: (ctx: { page: number }) => ctx.page,
-    key: (_ctx, page) => `coded:p${page}`,
+    key: ({ pageIndex: page }) => `coded:p${page}`,
     codec: pageCodec,
     fetch: async (_ctx, { skip, limit }) => {
       fetches++
@@ -367,7 +368,7 @@ test('createSwrPaginatedCache: single page codec round-trips primary and prefetc
     totalDocs: 4,
   })
   assert.equal(fetches, 1)
-  await swr.flush()
+  await swr.drain()
 })
 
 test('createSwrPaginatedCache: a default (staleWait 0) stale refresh warms secondary pages in the tracked background refresh', async (t) => {
@@ -385,7 +386,7 @@ test('createSwrPaginatedCache: a default (staleWait 0) stale refresh warms secon
     pageSize: 2,
     prefetchPages: 1,
     pageIndex: (ctx: { page: number }) => ctx.page,
-    key: (_ctx, page) => `bg-stale:p${page}`,
+    key: ({ pageIndex: page }) => `bg-stale:p${page}`,
     fetch: async () => {
       version++
       return [version * 10 + 1, version * 10 + 2, version * 10 + 3, version * 10 + 4]
@@ -396,7 +397,7 @@ test('createSwrPaginatedCache: a default (staleWait 0) stale refresh warms secon
 
   assert.deepEqual(await cache.get({ page: 0 }), { docs: [0], pageIndex: 0, pageSize: 2 })
   assert.equal(waitUntilPromises.length, 1)
-  await swr.flush()
+  await swr.drain()
   assert.deepEqual(await cache.get({ page: 0 }), { docs: [11, 12], pageIndex: 0, pageSize: 2 })
   assert.deepEqual(await cache.get({ page: 1 }), { docs: [13, 14], pageIndex: 1, pageSize: 2 })
   assert.equal(version, 1)
@@ -412,14 +413,14 @@ test('createSwrPaginatedCache: overwrites fresh and stale secondary pages in Red
     redis,
     memory: true,
     ttl: 10,
-    staleMultiplier: 2,
+    stale: ({ ttl }) => ttl,
   })
 
   const cache = createSwrPaginatedCache(swr, {
     pageSize: 2,
     prefetchPages: 2,
     pageIndex: (ctx: { page: number }) => ctx.page,
-    key: (_ctx, page) => `overwrite:p${page}`,
+    key: ({ pageIndex: page }) => `overwrite:p${page}`,
     ttl: ({ value }) => {
       ttlCalls++
       return value.docs.length > 0 ? 10 : 1
@@ -453,7 +454,7 @@ test('createSwrPaginatedCache: a secondary clone failure fails the batch before 
     pageSize: 1,
     prefetchPages: 2,
     pageIndex: (page) => page,
-    key: (_ctx, page) => `clone:p${page}`,
+    key: ({ pageIndex: page }) => `clone:p${page}`,
     fetch: async () => [{ id: 1 }, { id: 2, callback: () => 2 }, { id: 3 }],
     codec: {
       encode: (page) => Buffer.from(JSON.stringify(page)),
@@ -485,7 +486,7 @@ test('createSwrPaginatedCache: a throwing key callback for a secondary page fail
     pageSize: 1,
     prefetchPages: 2,
     pageIndex: (page: number) => page,
-    key: (_ctx, page) => {
+    key: ({ pageIndex: page }) => {
       if (page === 1) throw keyError
       return `key-failure:p${page}`
     },

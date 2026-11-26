@@ -50,6 +50,7 @@ const ERROR_SEVERITY: { [R in FixedSeverityReason]: ErrorEventFor<R>['severity']
   lock_release_failure: 'warn',
   lock_renewal_failure: 'warn',
   lock_lost: 'warn',
+  unreadable_entry: 'warn',
 }
 
 export function errorEvent<R extends FixedSeverityReason>(

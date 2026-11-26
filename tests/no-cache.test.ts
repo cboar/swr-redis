@@ -112,7 +112,7 @@ for (const stale of ['detached', 'inline', 'inline with waiter'] as const) {
         redis,
         memory: true,
         ttl: 1,
-        staleMultiplier: 10,
+        stale: ({ ttl }) => ttl * 9,
         runtime: stale === 'detached' ? 'server' : 'serverless',
         staleWait: stale === 'inline with waiter' ? 10 : 0,
         pollInterval: 0.005,
@@ -152,7 +152,7 @@ for (const stale of ['detached', 'inline', 'inline with waiter'] as const) {
 
       assert.equal(await winner, stale === 'detached' ? 'stored' : 'transient')
       if (waiter) assert.equal(await waiter, 'stored')
-      await swr.flush()
+      await swr.drain()
       assert.equal(calls, 2)
       assert.deepEqual(await redis.getBuffer(dataKey('stale-nocache')), rawBefore)
       assert.equal(await redis.get(lockKey('stale-nocache')), null)

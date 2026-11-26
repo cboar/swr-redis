@@ -21,11 +21,11 @@ export function lockContract(
       const beta = new RedisLock(redis, 'lock:user:123')
 
       assert.equal(await alpha.acquire(5000), 'acquired')
-      assert.equal(await redis.get(alpha.key), alpha.token)
+      assert.deepEqual(await redis.getBuffer(alpha.key), alpha.token)
       await assertTtl(redis, alpha.key, 5000)
 
       assert.equal(await beta.acquire(5000), 'busy')
-      assert.equal(await redis.get(alpha.key), alpha.token)
+      assert.deepEqual(await redis.getBuffer(alpha.key), alpha.token)
     },
   )
 
@@ -40,11 +40,11 @@ export function lockContract(
 
       assert.equal(await owner.acquire(2000), 'acquired')
       assert.equal(await owner.acquire(5000), 'acquired')
-      assert.equal(await redis.get(owner.key), owner.token)
+      assert.deepEqual(await redis.getBuffer(owner.key), owner.token)
       await assertTtl(redis, owner.key, 5000)
 
       assert.equal(await other.acquire(5000), 'busy')
-      assert.equal(await redis.get(owner.key), owner.token)
+      assert.deepEqual(await redis.getBuffer(owner.key), owner.token)
     },
   )
 
@@ -122,7 +122,7 @@ export function lockContract(
       assert.equal(result, false)
       assert.equal(await redis.get('dataset:2'), null)
       assert.equal(await redis.get('dataset:2:warm'), null)
-      assert.equal(await redis.get(owner.key), owner.token)
+      assert.deepEqual(await redis.getBuffer(owner.key), owner.token)
     },
   )
 
@@ -152,7 +152,7 @@ export function lockContract(
         ]),
       )
 
-      assert.equal(await redis.get(lock.key), lock.token)
+      assert.deepEqual(await redis.getBuffer(lock.key), lock.token)
       assert.deepEqual(await redis.getBuffer('dataset:err:primary'), Buffer.from('primary-ok'))
       assert.deepEqual(await redis.getBuffer('dataset:err:ok'), Buffer.from('warm-ok'))
       assert.equal(await redis.getBuffer('dataset:err:bad'), null)
@@ -169,7 +169,7 @@ export function lockContract(
     await owner.acquire(10000)
 
     assert.equal(await other.release(), false)
-    assert.equal(await redis.get(owner.key), owner.token)
+    assert.deepEqual(await redis.getBuffer(owner.key), owner.token)
 
     assert.equal(await owner.release(), true)
     assert.equal(await redis.get(owner.key), null)
@@ -188,7 +188,7 @@ export function lockContract(
 
       assert.equal(await owner.acquire(10_000), 'acquired')
       assert.equal(await other.cooldown(5000), false)
-      assert.equal(await redis.get(owner.key), owner.token)
+      assert.deepEqual(await redis.getBuffer(owner.key), owner.token)
 
       assert.equal(await owner.cooldown(5000), true)
       assert.equal(await redis.get(owner.key), COOLDOWN_MARKER)
@@ -235,7 +235,7 @@ export function lockContract(
 
       await expire(redis, owner.key, 5000)
       assert.equal(await next.acquire(10_000), 'acquired')
-      assert.equal(await redis.get(next.key), next.token)
+      assert.deepEqual(await redis.getBuffer(next.key), next.token)
     },
   )
 
@@ -247,13 +247,13 @@ export function lockContract(
 
     await lock.acquire(10_000)
     const before = Number(await redis.pttl(lock.key))
-    assert.equal(await redis.swrExtendLock(lock.key, 'other-token', 50_000), '0')
+    assert.equal(await redis.swrExtendLock(lock.key, Buffer.from('other-token'), 50_000), '0')
     const afterWrongToken = Number(await redis.pttl(lock.key))
     assert.ok(afterWrongToken <= before && afterWrongToken >= before - 2_000)
     assert.equal(await redis.swrExtendLock(lock.key, lock.token, 50_000), '1')
     await assertTtl(redis, lock.key, 50_000)
     // A shorter TTL never shortens the lock, and ownership is still checked first.
-    assert.equal(await redis.swrExtendLock(lock.key, 'other-token', 10_000), '0')
+    assert.equal(await redis.swrExtendLock(lock.key, Buffer.from('other-token'), 10_000), '0')
     assert.equal(await redis.swrExtendLock(lock.key, lock.token, 10_000), '1')
     await assertTtl(redis, lock.key, 50_000)
     await expire(redis, lock.key, 50_000)

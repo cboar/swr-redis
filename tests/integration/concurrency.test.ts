@@ -22,7 +22,7 @@ test(
     const options = {
       redis,
       ttl: 5,
-      staleMultiplier: 6,
+      stale: 25,
       pollInterval: 0.015,
       onEvent: (event: SwrEvent) => {
         if (event.type === 'miss' && event.action === 'wait' && ++waiters === 49)
@@ -113,7 +113,7 @@ for (const phase of ['cold', 'stale'] as const) {
       else {
         // An attached winner serves stale data after its refresh fails.
         assert.equal(await failing.get(), 'stale')
-        await failingSwr.flush()
+        await failingSwr.drain()
       }
       assert.equal(await redis.get(lockKey), COOLDOWN_MARKER)
       const pttl = await redis.pttl(lockKey)

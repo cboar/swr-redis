@@ -21,7 +21,7 @@ export function decodeEnvelope<T>(
   buffer: Uint8Array,
   codec: SwrCodec<T> = DEFAULT_CODEC as SwrCodec<T>,
 ): EnvelopeFields<T> {
-  const header = readEnvelopeHeader(buffer)
+  const header = readEnvelopeHeader(buffer)!
   return {
     value: decodeEnvelopeValue(buffer, header, codec),
     ...header.timing,

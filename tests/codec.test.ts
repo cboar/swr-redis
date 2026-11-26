@@ -54,12 +54,13 @@ test('Default BSON codec preserves documented data types through Redis with memo
   }
 })
 
-test('25-byte envelope header: small payloads stay raw, large payloads compress, and reader decodes both seamlessly', () => {
+test('32-byte envelope header: small payloads stay raw, large payloads compress, and reader decodes both seamlessly', () => {
   const smallEnv = { value: 'hi', cachedAtMs: 1000, freshUntilMs: 6000, expiresAtMs: 26000 }
   const smallBuf = encodeEnvelope(smallEnv)
   assert.ok(smallBuf.byteLength > ENVELOPE_HEADER_SIZE)
-  assert.equal(smallBuf[0], 0x00)
+  assert.equal(smallBuf[4], 0x00)
   assert.deepEqual(readEnvelopeHeader(smallBuf), {
+    headerLength: ENVELOPE_HEADER_SIZE,
     deflated: false,
     timing: {
       cachedAtMs: 1000,
@@ -77,8 +78,8 @@ test('25-byte envelope header: small payloads stay raw, large payloads compress,
     expiresAtMs: 27000,
   }
   const compressedBuf = encodeEnvelope(compressedEnv)
-  assert.equal(compressedBuf[0], 0x01)
-  assert.equal(readEnvelopeHeader(compressedBuf).deflated, true)
+  assert.equal(compressedBuf[4], 0x01)
+  assert.equal(readEnvelopeHeader(compressedBuf)!.deflated, true)
   assert.ok(compressedBuf.byteLength < 200)
   assert.deepEqual(decodeEnvelope<string>(compressedBuf), compressedEnv)
 
@@ -90,7 +91,7 @@ test('25-byte envelope header: small payloads stay raw, large payloads compress,
     expiresAtMs: 28000,
   }
   const rawLargeBuf = encodeEnvelope(rawLargeEnv, undefined, false)
-  assert.equal(readEnvelopeHeader(rawLargeBuf).deflated, false)
+  assert.equal(readEnvelopeHeader(rawLargeBuf)!.deflated, false)
   assert.ok(rawLargeBuf.byteLength > 1000)
   assert.deepEqual(decodeEnvelope<string>(rawLargeBuf), rawLargeEnv)
 
@@ -102,7 +103,7 @@ test('25-byte envelope header: small payloads stay raw, large payloads compress,
     expiresAtMs: 29000,
   }
   const levelZero = encodeEnvelope(levelZeroEnv, undefined, { level: 0 })
-  assert.equal(readEnvelopeHeader(levelZero).deflated, false)
+  assert.equal(readEnvelopeHeader(levelZero)!.deflated, false)
   assert.deepEqual(decodeEnvelope<string>(levelZero), levelZeroEnv)
 
   const lowThresholdEnv = {
@@ -112,12 +113,17 @@ test('25-byte envelope header: small payloads stay raw, large payloads compress,
     expiresAtMs: 30000,
   }
   const lowThreshold = encodeEnvelope(lowThresholdEnv, undefined, { level: 6, minBytes: 10 })
-  assert.equal(readEnvelopeHeader(lowThreshold).deflated, true)
+  assert.equal(readEnvelopeHeader(lowThreshold)!.deflated, true)
   assert.deepEqual(decodeEnvelope<string>(lowThreshold), lowThresholdEnv)
 })
 
 test('readEnvelopeHeader rejects a truncated slice instead of reading the backing buffer', () => {
-  const backing = Buffer.alloc(64, 0x42)
+  const envelope = { value: 'x', cachedAtMs: 1, freshUntilMs: 2, expiresAtMs: 3 }
+  const backing = Buffer.concat([
+    Buffer.alloc(8, 0x42),
+    encodeEnvelope(envelope),
+    Buffer.alloc(8, 0x42),
+  ])
   assert.throws(
     () => readEnvelopeHeader(backing.subarray(8, 8 + ENVELOPE_HEADER_SIZE - 1)),
     RangeError,
@@ -135,7 +141,7 @@ test('Custom codec handles empty payloads and nonzero-offset Uint8Array views cl
   const emptyEnv = { value: 'empty-ok', cachedAtMs: 10, freshUntilMs: 20, expiresAtMs: 30 }
   const emptyBuf = encodeEnvelope(emptyEnv, emptyCodec)
   assert.equal(emptyBuf.byteLength, ENVELOPE_HEADER_SIZE)
-  assert.equal(readEnvelopeHeader(emptyBuf).deflated, false)
+  assert.equal(readEnvelopeHeader(emptyBuf)!.deflated, false)
   assert.deepEqual(decodeEnvelope(emptyBuf, emptyCodec), emptyEnv)
 
   const backing = new Uint8Array([0xaa, 0xbb, 0x68, 0x69, 0xcc])
@@ -348,7 +354,7 @@ for (const [path, fault, expectedEvents] of [
       { value: 'unreadable', cachedAtMs: 1000, freshUntilMs: 2000, expiresAtMs: 5000 },
       codec,
     )
-    if (fault === 'decompression') broken[0] = 1
+    if (fault === 'decompression') broken[4] = 1
     const matchesFailure = (error: unknown) =>
       fault === 'decompression'
         ? error instanceof Error && 'code' in error && error.code === 'Z_DATA_ERROR'
@@ -401,7 +407,7 @@ for (const [path, fault, expectedEvents] of [
 
     assert.deepEqual(
       events.map((event) =>
-        event.type === 'poll'
+        event.type === 'wait'
           ? `poll:${event.outcome}`
           : event.type === 'miss'
             ? `miss:${event.action}`

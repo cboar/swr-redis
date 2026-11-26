@@ -1,7 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type { Redis } from 'ioredis'
 
-// Held in the lock key after a failed fetch. Owner tokens are UUIDs, so it can't collide.
+// Held in the lock key after a failed fetch. Owner tokens are 8 bytes, so it can't collide.
 export const COOLDOWN_MARKER = 'CD'
 const COOLDOWN_MARKER_BUFFER = Buffer.from(COOLDOWN_MARKER)
 
@@ -75,14 +75,14 @@ export interface RedisWriteEntry {
 type LuaFlag = '0' | '1'
 
 interface SwrRedisCommands {
-  swrAcquireLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<AcquireOutcome>
-  swrCooldownLock: (lockKey: string, token: string, cooldownMs: number) => Promise<LuaFlag>
-  swrExtendLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<LuaFlag>
+  swrAcquireLock: (lockKey: string, token: Buffer, lockTtlMs: number) => Promise<AcquireOutcome>
+  swrCooldownLock: (lockKey: string, token: Buffer, cooldownMs: number) => Promise<LuaFlag>
+  swrExtendLock: (lockKey: string, token: Buffer, lockTtlMs: number) => Promise<LuaFlag>
   swrCommitAndRelease: (
     numberOfKeys: number,
     args: readonly (string | Buffer | number)[],
   ) => Promise<LuaFlag>
-  swrReleaseLock: (lockKey: string, token: string) => Promise<LuaFlag>
+  swrReleaseLock: (lockKey: string, token: Buffer) => Promise<LuaFlag>
   swrSetAndClearLock: (
     dataKey: string,
     lockKey: string,
@@ -116,7 +116,8 @@ export function registerLockCommands(redis: Redis): SwrRedis {
 
 export class RedisLock {
   readonly key: string
-  readonly token = randomUUID()
+  // Raw bytes: Lua compares strings byte for byte and ioredis sends Buffers unchanged.
+  readonly token = randomBytes(8)
   private readonly redis: SwrRedis
 
   constructor(redis: SwrRedis, key: string) {
@@ -154,7 +155,7 @@ export class RedisLock {
           },
         )
       },
-      // At 40%, a promptly failed renewal can retry with about 20% of the lease left.
+      // At 40%, a promptly failed renewal can retry with about 20% of the lock TTL left.
       Math.max(1, Math.floor(lockTtlMs * 0.4)),
     )
     timer.unref()

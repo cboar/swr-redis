@@ -117,7 +117,7 @@ const paginated: SwrCache<
   pageSize: 10,
   prefetchPages: 1,
   pageIndex: (ctx: { page: number }) => ctx.page,
-  key: (_ctx, page, size) => `p:${page}:${size}`,
+  key: ({ pageIndex: page, pageSize: size }) => `p:${page}:${size}`,
   fetch: async () => ({ docs: [{ id: '1' }], totalDocs: 1 }),
 })
 const pageRes: Promise<SwrPaginatedPage<{ id: string }>> = paginated.get({ page: 0 })

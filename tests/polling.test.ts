@@ -124,7 +124,7 @@ test(
     assert.equal(redis.setCallCount - sets, 1, 'the test write')
     assert.deepEqual(events, [
       { type: 'miss', key: 'passive', action: 'wait' },
-      { type: 'poll', key: 'passive', outcome: 'resolved', attempts: 3, durationMs: 30 },
+      { type: 'wait', key: 'passive', outcome: 'resolved', durationMs: 30 },
     ])
   },
 )
@@ -167,8 +167,8 @@ test(
     assert.ok(await redis.getBuffer(dataKey('steal')))
     assert.deepEqual(events, [
       { type: 'miss', key: 'steal', action: 'wait' },
-      { type: 'poll', key: 'steal', outcome: 'lock_stolen', attempts: 3, durationMs: 30 },
-      { type: 'refresh', key: 'steal', trigger: 'lock_stolen', durationMs: 0 },
+      { type: 'wait', key: 'steal', outcome: 'lock_takeover', durationMs: 30 },
+      { type: 'refresh', key: 'steal', trigger: 'lock_takeover', durationMs: 0 },
     ])
   },
 )
@@ -214,7 +214,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
       assert.equal(events.length, 3)
       assert.deepEqual(events.slice(0, 2), [
         { type: 'miss', key: 'timeout', action: 'wait' },
-        { type: 'poll', key: 'timeout', outcome: 'timeout', attempts: 3, durationMs: 30 },
+        { type: 'wait', key: 'timeout', outcome: 'timeout', durationMs: 30 },
       ])
       const error = events[2]
       assert.ok(error?.type === 'error' && error.reason === 'timeout')
@@ -299,8 +299,8 @@ for (const recovers of [true, false]) {
         )
         assert.equal(await redis.get(lockKey('cooling')), COOLDOWN_MARKER)
       }
-      assert.deepEqual(events.flatMap((e) => (e.type === 'poll' ? [e.outcome] : [])).sort(), [
-        'lock_stolen',
+      assert.deepEqual(events.flatMap((e) => (e.type === 'wait' ? [e.outcome] : [])).sort(), [
+        'lock_takeover',
         recovers ? 'resolved' : 'timeout',
       ])
       assert.deepEqual(
@@ -515,7 +515,7 @@ for (const scenario of ['timeout', 'unlocked'] as const) {
       assert.equal(acquireCalls, 1, 'stale waiter must not attempt lock steal')
       assert.equal(fetches, 0)
       assert.deepEqual(
-        events.map((event) => (event.type === 'poll' ? event.outcome : event.type)),
+        events.map((event) => (event.type === 'wait' ? event.outcome : event.type)),
         ['hit', scenario === 'timeout' ? 'timeout' : 'stale_fallback'],
       )
     },

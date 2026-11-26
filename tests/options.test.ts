@@ -28,14 +28,17 @@ const INVALID_OPTION_CASES: InvalidOptionCase[] = [
     expectedFragment: 'ttl',
   })),
   {
-    label: 'same-layer oversized ttl * staleMultiplier',
-    options: { ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000) + 1, staleMultiplier: 2 },
+    label: 'same-layer oversized ttl + stale',
+    options: {
+      ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000) + 1,
+      stale: Math.floor(Number.MAX_SAFE_INTEGER / 2000) + 1,
+    },
     expectedFragment: 'ttl',
   },
-  ...([0.5, 0, -1, NaN, Infinity] as const).map((staleMultiplier) => ({
-    label: `staleMultiplier=${String(staleMultiplier)}`,
-    options: { staleMultiplier },
-    expectedFragment: 'staleMultiplier',
+  ...([-1, NaN, Infinity, -Infinity] as const).map((stale) => ({
+    label: `stale=${String(stale)}`,
+    options: { stale },
+    expectedFragment: 'stale must',
   })),
   ...([0, -1, NaN, Infinity, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map((lockTtl) => ({
     label: `lockTtl=${String(lockTtl)}`,
@@ -110,14 +113,14 @@ test('Options validation: rejects empty prefixes, cache names, and keys', async 
   const dynamic = swr.cache({ key: () => '', fetch: async () => 'v' })
   assert.throws(() => dynamic.key(), rejects('key'))
   await assert.rejects(dynamic.get(), rejects('key'))
-  await assert.rejects(swr.invalidateKeys(''), rejects('key'))
+  await assert.rejects(swr.invalidateKeys(['']), rejects('key'))
 
   // Every key is validated before any eviction.
   const withMemory = createSwrClient({ redis, memory: true })
   const a = withMemory.cache({ key: 'a', fetch: async () => 'fetched' })
   await a.set(undefined, 'kept')
   await redis.unlink(keys.data('a'))
-  await assert.rejects(withMemory.invalidateKeys('a', ''), rejects('key'))
+  await assert.rejects(withMemory.invalidateKeys(['a', '']), rejects('key'))
   assert.equal(await a.get(), 'kept')
 })
 
@@ -127,35 +130,34 @@ test('Options validation: enforces merged cross-layer resolved Redis TTL ceiling
 
   const clientWithHighTtl = createSwrClient({ redis, ttl: halfMaxPlusOne })
   assert.throws(
-    () => clientWithHighTtl.cache({ key: 'cross-ttl-default-mult', fetch: async () => 'v' }),
-    SwrValidationError,
-  )
-  assert.throws(
     () =>
       clientWithHighTtl.cache({
-        key: 'cross-ttl-mult-2',
-        staleMultiplier: 2,
+        key: 'cross-ttl-high-stale',
+        stale: halfMaxPlusOne,
         fetch: async () => 'v',
       }),
     SwrValidationError,
   )
   clientWithHighTtl.cache({
-    key: 'cross-ttl-mult-1',
-    staleMultiplier: 1,
+    key: 'cross-ttl-no-stale',
+    stale: 0,
     fetch: async () => 'v',
   })
 
-  const clientWithMult2 = createSwrClient({ redis, staleMultiplier: 2 })
+  const clientWithHighStale = createSwrClient({
+    redis,
+    stale: Math.floor(Number.MAX_SAFE_INTEGER / 2000),
+  })
   assert.throws(
     () =>
-      clientWithMult2.cache({
+      clientWithHighStale.cache({
         key: 'cross-mult-high-ttl',
         ttl: halfMaxPlusOne,
         fetch: async () => 'v',
       }),
     SwrValidationError,
   )
-  clientWithMult2.cache({
+  clientWithHighStale.cache({
     key: 'cross-mult-max-ttl',
     ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000),
     fetch: async () => 'v',
@@ -210,7 +212,7 @@ test('Options validation: accepts valid boundary values on client and cache over
   const boundaryOptions: SwrSharedOptions[] = [
     {
       ttl: 0.1,
-      staleMultiplier: 1,
+      stale: 0,
       lockTtl: 0.05,
       fetchTimeout: 0.05,
       staleWait: 0,
@@ -220,12 +222,12 @@ test('Options validation: accepts valid boundary values on client and cache over
     },
     {
       ttl: 1,
-      staleMultiplier: 2,
+      stale: 1,
       compression: true,
     },
     {
       ttl: Math.floor(Number.MAX_SAFE_INTEGER / 1000),
-      staleMultiplier: 1,
+      stale: 0,
     },
     {
       compression: { level: 0, minBytes: 0 },
@@ -264,7 +266,7 @@ test('Options validation: accepts valid boundary values on client and cache over
 test('Options inheritance: numeric client TTL and per-cache dynamic override set independent deadlines', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
-  const swr = createSwrClient({ redis, ttl: 0.2, staleMultiplier: 1 })
+  const swr = createSwrClient({ redis, ttl: 0.2, stale: 0 })
   const inherited = swr.cache({ key: 'inherited', fetch: async () => null })
   let calls = 0
   const overridden = swr.cache({

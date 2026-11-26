@@ -10,13 +10,14 @@ import type {
   SwrMemoryOptions,
   SwrRuntime,
   SwrSharedOptions,
+  SwrStaleOption,
   SwrTtlOption,
 } from './types.ts'
 
 export const DEFAULTS = {
   prefix: 'default',
   ttl: 120,
-  staleMultiplier: 5,
+  stale: ({ ttl }: { ttl: number }) => ttl * 4,
   runtime: 'server',
   failureStrategy: 'availability',
   fetchTimeout: 30,
@@ -45,9 +46,9 @@ export interface ResolvedClientOptions {
 export interface ResolvedCacheOptions<T, Context> {
   readonly keyOf: (context: Context) => string
   readonly ttl: SwrTtlOption<T, Context>
-  readonly staleMultiplier: number
+  readonly stale: SwrStaleOption<T, Context>
   readonly failureStrategy: SwrFailureStrategy
-  // Also caps how long a caller polls behind another fetch.
+  // Also caps how long a caller waits behind another fetch.
   readonly fetchTimeoutMs: number
   // 0 or Infinity allowed.
   readonly staleWaitMs: number
@@ -77,8 +78,10 @@ export function resolveClientOptions(
   } = options
   requireNonEmpty(prefix, 'prefix')
   validateFields(shared)
-  // A cache may still complete these fields, so only check what the client sets.
-  if (shared.ttl !== undefined) toRedisTtlMs(shared.ttl, shared.staleMultiplier ?? 1)
+  // A cache may still override these fields, so only check what the client sets.
+  if (shared.ttl !== undefined) {
+    toRedisTtlMs(shared.ttl + (typeof shared.stale === 'number' ? shared.stale : 0))
+  }
   return {
     prefix,
     runtime,
@@ -94,17 +97,17 @@ export function resolveCacheOptions<T, Context>(
   cache: SwrCacheOptions<T, Context>,
 ): ResolvedCacheOptions<T, Context> {
   if (cache.name !== undefined) requireNonEmpty(cache.name, 'name')
-  validateFields({ ...cache, ttl: numericTtl(cache.ttl) })
+  validateFields({ ...cache, ttl: numeric(cache.ttl), stale: numeric(cache.stale) })
   const { shared } = client
   const ttl = cache.ttl ?? shared.ttl ?? DEFAULTS.ttl
-  const staleMultiplier =
-    cache.staleMultiplier ?? shared.staleMultiplier ?? DEFAULTS.staleMultiplier
-  if (typeof ttl === 'number') toRedisTtlMs(ttl, staleMultiplier)
+  const stale = cache.stale ?? shared.stale ?? DEFAULTS.stale
+  // A callback stale can only add to a numeric ttl, so a ttl alone may already be too large.
+  if (typeof ttl === 'number') toRedisTtlMs(ttl + (typeof stale === 'number' ? stale : 0))
 
   return {
     keyOf: resolveKey(cache.key),
     ttl,
-    staleMultiplier,
+    stale,
     failureStrategy: cache.failureStrategy ?? client.failureStrategy,
     fetchTimeoutMs: toMs(cache.fetchTimeout ?? shared.fetchTimeout ?? DEFAULTS.fetchTimeout),
     staleWaitMs: toNonNegativeMs(cache.staleWait ?? shared.staleWait ?? DEFAULTS.staleWait),
@@ -129,7 +132,7 @@ export function resolveMemory(option: boolean | SwrMemoryOptions | undefined) {
   if (!option) return undefined
   const { maxEntries, maxTtl, clone } = option === true ? {} : option
   check(maxEntries, isPositiveSafeInteger, 'memory.maxEntries must be a positive safe integer')
-  check(maxTtl, isPositiveFinite, 'memory.maxTtl must be a positive finite number')
+  if (maxTtl !== undefined) requirePositive(maxTtl, 'memory.maxTtl')
   return {
     maxEntries: maxEntries ?? DEFAULTS.memory.maxEntries,
     maxTtlMs: toMs(maxTtl ?? DEFAULTS.memory.maxTtl),
@@ -137,9 +140,9 @@ export function resolveMemory(option: boolean | SwrMemoryOptions | undefined) {
   }
 }
 
-// A `ttl` callback is validated per result at write time instead.
-function numericTtl(ttl: unknown) {
-  return typeof ttl === 'number' ? ttl : undefined
+// `ttl` and `stale` callbacks are validated per result at write time instead.
+function numeric(option: unknown) {
+  return typeof option === 'number' ? option : undefined
 }
 
 function resolveKey<Context>(key: string | ((context: Context) => string)) {
@@ -158,7 +161,7 @@ export function resolveCompression(option: SwrCompressionOption | undefined) {
 function validateFields(layer: SwrSharedOptions) {
   const {
     ttl,
-    staleMultiplier,
+    stale,
     fetchTimeout,
     staleWait,
     failureCooldown,
@@ -168,12 +171,8 @@ function validateFields(layer: SwrSharedOptions) {
   } = layer
   const { level, minBytes } = typeof compression === 'object' ? compression : {}
 
-  check(ttl, isPositiveFinite, 'ttl must be a positive finite number')
-  check(
-    staleMultiplier,
-    (v) => Number.isFinite(v) && v >= 1,
-    'staleMultiplier must be a finite number >= 1',
-  )
+  if (ttl !== undefined) requirePositive(ttl, 'ttl')
+  if (typeof stale === 'number') requireNonNegative(stale, 'stale')
   check(
     fetchTimeout,
     isTimerSeconds,
@@ -224,14 +223,19 @@ function fail(message: string): never {
   throw new SwrValidationError(message)
 }
 
-export function requireTtl(ttl: number, label: string) {
-  if (!isPositiveFinite(ttl)) fail(`${label} must be a positive finite number`)
-  return ttl
+export function requirePositive(value: number, label: string) {
+  if (!isPositiveFinite(value)) fail(`${label} must be a positive finite number`)
+  return value
+}
+
+export function requireNonNegative(value: number, label: string) {
+  if (!Number.isFinite(value) || value < 0) fail(`${label} must be a non-negative finite number`)
+  return value
 }
 
 // Ceil so Redis never expires a key before its header's expiresAtMs.
-export function toRedisTtlMs(ttl: number, staleMultiplier: number) {
-  const ms = Math.ceil(ttl * staleMultiplier * 1000)
+export function toRedisTtlMs(lifetime: number) {
+  const ms = Math.ceil(lifetime * 1000)
   if (!Number.isSafeInteger(ms)) {
     fail(`Resolved Redis ttl exceeds maximum supported duration (${Number.MAX_SAFE_INTEGER}ms)`)
   }

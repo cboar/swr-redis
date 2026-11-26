@@ -1,14 +1,14 @@
 import type { Redis } from 'ioredis'
 import { registerLockCommands, type AcquireOutcome } from '../../src/lock.ts'
 
-export type Acquire = (key: string, token: string, ttlMs: number) => Promise<AcquireOutcome>
+export type Acquire = (key: string, token: Buffer, ttlMs: number) => Promise<AcquireOutcome>
 
 export function interceptAcquire(
   redis: Redis,
   intercept: (
     acquire: Acquire,
     key: string,
-    token: string,
+    token: Buffer,
     ttlMs: number,
   ) => Promise<AcquireOutcome>,
 ): void {

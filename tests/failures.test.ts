@@ -122,7 +122,7 @@ test(
             ? cache.set(undefined, 'v')
             : operation === 'invalidate'
               ? cache.invalidate()
-              : client.invalidateKeys('k')
+              : client.invalidateKeys(['k'])
         if (failureStrategy === 'protect-source')
           await assert.rejects(run, SwrRedisError, `${failureStrategy} ${operation}`)
         else await run()
@@ -144,7 +144,7 @@ test('Inline refresh propagates the fetch error when the snapshot expires during
   }).cache<string>({
     key: 'inline-expiry',
     ttl: 1,
-    staleMultiplier: 2,
+    stale: ({ ttl }) => ttl,
     fetch: async () => {
       fetches++
       redis.advanceTime(1000)
@@ -171,7 +171,7 @@ for (const stage of ['acquire', 'poll'] as const) {
       staleWait: 10,
       failureStrategy: 'protect-source',
       pollInterval: 0.001,
-    }).cache({ key: 'redis-expiry', ttl: 1, staleMultiplier: 2, fetch: async () => 'fresh' })
+    }).cache({ key: 'redis-expiry', ttl: 1, stale: ({ ttl }) => ttl, fetch: async () => 'fresh' })
     await cache.set(undefined, 'stale')
     redis.advanceTime(1000)
     const failAtExpiry = async () => {
@@ -314,7 +314,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
           events.map((e) =>
             e.type === 'hit'
               ? `hit:${e.stale}:${e.startedRevalidation}`
-              : e.type === 'poll'
+              : e.type === 'wait'
                 ? `poll:${e.outcome}`
                 : e.type,
           ),
@@ -424,7 +424,7 @@ test('A throwing isFatal in a background refresh reports fatal without rejecting
   assert.equal(await cache.get(), 'original')
   assert.ok(tracked)
   await tracked
-  await swr.flush()
+  await swr.drain()
   assert.equal(await redis.get(toLockKey('bg-reject-inflight')), COOLDOWN_MARKER)
   assert.deepEqual(
     events.filter((e) => e.type === 'error'),
@@ -523,7 +523,7 @@ for (const phase of ['cold', 'stale'] as const) {
         assert.ok(lock && lock !== COOLDOWN_MARKER, 'the refresh still holds the lock')
 
         release.resolve()
-        await swr.flush()
+        await swr.drain()
         assert.deepEqual(
           events.map((e) => (e.type === 'error' ? `${e.reason}:${e.severity}` : e.type)),
           DETACHED_EVENTS[phase][outcome],
@@ -579,7 +579,7 @@ for (const phase of ['cold', 'stale'] as const) {
       await assert.rejects(pending, (error) => error === reason)
       assert.equal(await redis.get(toLockKey('poll-abort')), 'other-owner')
       assert.deepEqual(
-        events.map((event) => (event.type === 'poll' ? event.outcome : event.type)),
+        events.map((event) => (event.type === 'wait' ? event.outcome : event.type)),
         [phase === 'cold' ? 'miss' : 'hit', 'cancelled'],
       )
     },
@@ -651,7 +651,7 @@ for (const [phase, mgetOutcome] of [
       await assert.rejects(pending, (err) => err === reason)
       assert.equal(acquireCalls, 1, 'only the initial acquire ran')
       assert.deepEqual(
-        events.map((event) => (event.type === 'poll' ? `poll:${event.outcome}` : event.type)),
+        events.map((event) => (event.type === 'wait' ? `poll:${event.outcome}` : event.type)),
         [phase === 'cold' ? 'miss' : 'hit', 'poll:cancelled'],
       )
     },
@@ -689,7 +689,7 @@ for (const acquireOutcome of ['acquired', 'contended', 'lost_reply'] as const) {
         return gatedSteal.command(acquire, lockKey, token, ttlMs)
       })
       const gatedSteal = gateCommand(
-        async (acquire: Acquire, lockKey: string, token: string, ttlMs: number) => {
+        async (acquire: Acquire, lockKey: string, token: Buffer, ttlMs: number) => {
           if (acquireOutcome === 'contended') {
             await redis.set(lockKey, 'other-owner', 'PX', 5000)
             return 'busy'
@@ -808,7 +808,7 @@ for (const [phase, acquireOutcome] of [
       redis.mgetBuffer = async () => assert.fail('aborted initial lock must not poll')
 
       const gatedAcquire = gateCommand(
-        async (acquire: Acquire, lockKey: string, token: string, ttlMs: number) => {
+        async (acquire: Acquire, lockKey: string, token: Buffer, ttlMs: number) => {
           const acquired = await acquire(lockKey, token, ttlMs)
           if (acquireOutcome === 'lost_reply') throw new Error('reply lost after acquire')
           return acquired
@@ -862,7 +862,7 @@ test(
     })
 
     const gatedAcquire = gateCommand(
-      async (acquire: Acquire, lockKey: string, token: string, ttlMs: number) =>
+      async (acquire: Acquire, lockKey: string, token: Buffer, ttlMs: number) =>
         acquire(lockKey, token, ttlMs),
       'before execution',
     )
@@ -919,7 +919,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
       assert.equal(tracked.length, 1)
 
       let flushed = false
-      const flushing = swr.flush().then(() => (flushed = true))
+      const flushing = swr.drain().then(() => (flushed = true))
       await setImmediate()
       assert.equal(flushed, false, 'flush waits for the pending release')
       release.release()

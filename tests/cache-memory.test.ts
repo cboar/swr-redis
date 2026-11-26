@@ -58,7 +58,7 @@ test('Memory: caches on a client share memory, kept consistent by set, invalidat
   await cacheB.invalidate('1')
   assert.equal(await cacheA.get('1'), 'A-1-2')
 
-  await swr.invalidateKeys('shared:1', 'other:key')
+  await swr.invalidateKeys(['shared:1', 'other:key'])
   assert.equal(await redis.getBuffer(toDataKey('shared:1')), null)
   assert.equal(await cacheB.get('1'), 'B-1-1')
 })
@@ -95,7 +95,7 @@ test('Memory: readers honor the writer-owned freshness without calling their own
   let writerTtlCalls = 0
   const writer = swr.cache<string | null>({
     key: 'shared-memory-dyn',
-    staleMultiplier: 3,
+    stale: ({ ttl }) => ttl * 2,
     ttl: ({ value }) => {
       writerTtlCalls++
       return value === null ? 1 : 5
@@ -127,7 +127,7 @@ test('Memory lifetime wiring: delayed Redis read uses the remaining non-sliding 
   const { redis, reads } = fakeClient(t)
   const writer = createSwrClient({ redis, memory: true }).cache<string | null>({
     key: 'dyn-memory-delay',
-    staleMultiplier: 2,
+    stale: ({ ttl }) => ttl,
     ttl: ({ value }) => (value === null ? 10 : 1),
     fetch: async () => null,
   })
@@ -163,7 +163,7 @@ test('Memory lifetime wiring: stored freshness expires a memory entry before the
   let fetchCalls = 0
   const cache = swr.cache<string | null>({
     key: 'dyn-memory-short',
-    staleMultiplier: 2,
+    stale: ({ ttl }) => ttl,
     ttl: ({ value }) => (value === null ? 0.05 : 2),
     fetch: async () => (++fetchCalls === 1 ? null : 'recovered'),
   })
@@ -255,7 +255,7 @@ test('Memory opt-out (cache and request): background refresh does not populate',
     redis.advanceTime(3000)
     value = 'new'
     assert.equal(await opted.get(undefined, getOptions), 'old', scope)
-    await swr.flush()
+    await swr.drain()
     const before = reads.count
     assert.equal(await shared.get(), 'new', scope)
     assert.equal(reads.count, before + 1, scope)
@@ -338,7 +338,7 @@ test('Failed writes evict memory and report the affected keys under both failure
           ? cache.set('a', 'new')
           : operation === 'invalidate'
             ? cache.invalidate('a')
-            : swr.invalidateKeys(...keys)
+            : swr.invalidateKeys(keys)
       const protectsSource = failureStrategy === 'protect-source'
       if (protectsSource) {
         await assert.rejects(
@@ -795,7 +795,7 @@ test('Memory: a background batch refresh replaces a still-fresh secondary once f
   await redis.set(toDataKey('p'), stored('p-old', 1000))
   await cache.set('sec', 'sec-old')
   assert.equal(await cache.get('p'), 'p-old')
-  await internals.flush()
+  await internals.drain()
   const reads = countReads(redis)
   assert.equal(await cache.get('sec'), 'sec-new')
   assert.equal(await cache.get('p'), 'p-new')

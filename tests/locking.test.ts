@@ -47,7 +47,7 @@ test('RedisLock.startRenewal: renews the full lockTtl every 40% of it, without a
   })
   for (let i = 0; i < 10; i++) await tick(t, redis, 40)
   assert.deepEqual(ttls, Array(10).fill(100))
-  assert.equal(await redis.get(lock.key), lock.token)
+  assert.deepEqual(await redis.getBuffer(lock.key), lock.token)
   assert.equal(renewal.lost, false)
 
   renewal.stop()

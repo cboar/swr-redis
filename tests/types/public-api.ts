@@ -9,7 +9,6 @@ import {
   type SwrErrorReason,
   type SwrFetchMeta,
   type SwrGetResult,
-  type SwrNonEmptyKeys,
   type SwrRuntime,
   type SwrSharedOptions,
   type SwrTimeoutPhase,
@@ -45,7 +44,7 @@ expectType<Promise<void>>(settingsCache.set(undefined, { theme: 'dark' }))
 expectType<Promise<void>>(settingsCache.invalidate())
 expectType<string>(settingsCache.key())
 declare const getResult: SwrGetResult<{ theme: 'dark' }>
-expectType<'memory' | 'redis' | 'fetch'>(getResult.source)
+expectType<'memory' | 'redis' | 'fetch' | 'direct'>(getResult.source)
 expectType<SwrEntryTiming | undefined>(getResult.timing)
 
 // Function key -> Context is inferred from key and flows into fetch.
@@ -197,7 +196,7 @@ if (evt.type === 'error') {
   expectType<'warn' | 'error'>(evt.severity)
   expectType<SwrErrorReason>(evt.reason)
   if (evt.reason === 'redis_error' || evt.reason === 'redis_error_fallback')
-    expectType<SwrNonEmptyKeys>(evt.keys)
+    expectType<readonly string[]>(evt.keys)
   if (evt.reason === 'stale_fallback') {
     expectType<'warn'>(evt.severity)
     expectType<'redis' | 'read' | 'refresh'>(evt.stage)
@@ -272,7 +271,7 @@ const articles = createSwrPaginatedCache(swr, {
   pageSize: 10,
   prefetchPages: 2,
   pageIndex: (ctx: ArticleQuery) => ctx.pageIndex,
-  key: (ctx, pageIndex, pageSize) => `articles:${ctx.topic}:${pageIndex}:${pageSize}`,
+  key: ({ context: ctx, pageIndex, pageSize }) => `articles:${ctx.topic}:${pageIndex}:${pageSize}`,
   fetch: async (ctx, range, meta) => {
     expectType<number>(range.limit)
     expectType<'attempt' | 'skip'>(meta.cacheWrite)
@@ -284,7 +283,7 @@ expectType<SwrCache<SwrPaginatedPage<{ id: string }>, ArticleQuery>>(articles)
 const arrayPages = createSwrPaginatedCache(swr, {
   pageSize: 5,
   pageIndex: (ctx: { page: number }) => ctx.page,
-  key: (_ctx, p, s) => `arr:${p}:${s}`,
+  key: ({ pageIndex: p, pageSize: s }) => `arr:${p}:${s}`,
   ttl: ({ context, value }) => {
     expectType<{ page: number }>(context)
     return value.docs.length === 0 ? 5 : 60
@@ -295,7 +294,7 @@ expectType<Promise<SwrPaginatedPage<{ id: number }>>>(arrayPages.get({ page: 0 }
 createSwrPaginatedCache(swr, {
   pageSize: 10,
   pageIndex: (ctx: { page: number }) => ctx.page,
-  key: (_ctx, p, s) => `invalid:${p}:${s}`,
+  key: ({ pageIndex: p, pageSize: s }) => `invalid:${p}:${s}`,
   // @ts-expect-error Primitive fetch result does not satisfy SwrPaginationData | SwrNoCache.
   fetch: async () => 42,
 })
@@ -304,7 +303,7 @@ createSwrPaginatedCache(swr, {
 const voidPages: SwrPaginatedCacheOptions<string> = {
   pageSize: 10,
   pageIndex: () => 0,
-  key: (_context, p) => `void:${p}`,
+  key: ({ pageIndex: p }) => `void:${p}`,
   fetch: async (_context, range: SwrPaginationRange) => [String(range.skip)],
 }
 expectType<Promise<SwrPaginatedPage<string>>>(createSwrPaginatedCache(swr, voidPages).get())
@@ -312,7 +311,7 @@ expectType<Promise<SwrPaginatedPage<string>>>(
   createSwrPaginatedCache(swr, {
     pageSize: 10,
     pageIndex: () => 0,
-    key: (_ctx, p) => `inferred-void:${p}`,
+    key: ({ pageIndex: p }) => `inferred-void:${p}`,
     fetch: async () => ['a'],
   }).get(),
 )

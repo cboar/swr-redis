@@ -41,7 +41,7 @@ test('SwrWriteBatch: writes different value types and codecs to different cache 
   const products = swr.cache({
     key: (category: string) => `products:${category}`,
     ttl: 60,
-    staleMultiplier: 2,
+    stale: ({ ttl }) => ttl,
     codec: {
       encode: (value: string[]) => Buffer.from(value.join(',')),
       decode: (bytes) => Buffer.from(bytes).toString().split(','),
@@ -69,9 +69,10 @@ test('SwrWriteBatch: writes different value types and codecs to different cache 
   const entry = decodeEnvelope((await redis.getBuffer(toDataKey('counts:shoes')))!, countsCodec)
   assert.equal(entry.cachedAtMs, 1000)
   assert.equal(entry.freshUntilMs, 31_000)
-  assert.equal(entry.expiresAtMs, 61_000)
+  // A secondary with its own ttl inherits the primary's resolved stale seconds (60).
+  assert.equal(entry.expiresAtMs, 91_000)
   assert.equal(await redis.pttl(toDataKey('products:shoes')), 120_000)
-  assert.equal(await redis.pttl(toDataKey('counts:shoes')), 60_000)
+  assert.equal(await redis.pttl(toDataKey('counts:shoes')), 90_000)
   assert.equal(await redis.pttl(toDataKey('last-fetched:shoes')), 120_000)
 
   assert.deepEqual(new SwrWriteBatch({ primary: 'only', ttl: 10 }).secondary, [])
@@ -80,7 +81,7 @@ test('SwrWriteBatch: writes different value types and codecs to different cache 
 test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secondary override)', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
-  const swr = createSwrClient({ redis, staleMultiplier: 3 })
+  const swr = createSwrClient({ redis, stale: ({ ttl }) => ttl * 2 })
 
   // 1. Dynamic TTL callback evaluated once with primary params/value; secondaries inherit or override
   const callbackInputs: Array<{ context: string; key: string; value: string | null }> = []
@@ -96,7 +97,7 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
         secondary: [
           { key: 'dyn:inherit', value: 'inherits-1s' },
           { key: 'dyn:long', value: 'override-10s', ttl: 10 },
-          { key: 'dyn:short', value: 'override-0.2s', ttl: 0.2 },
+          { key: 'dyn:short', value: 'override-0.1s', ttl: 0.1, stale: 0.2 },
         ],
       }),
   })
@@ -117,24 +118,24 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
     value: 'override-10s',
     cachedAtMs: 1000,
     freshUntilMs: 11_000,
-    expiresAtMs: 31_000,
+    expiresAtMs: 13_000,
   })
   assert.deepEqual(shortEnv, {
-    value: 'override-0.2s',
+    value: 'override-0.1s',
     cachedAtMs: 1000,
-    freshUntilMs: 1200,
-    expiresAtMs: 1600,
+    freshUntilMs: 1100,
+    expiresAtMs: 1300,
   })
   assert.equal(await redis.pttl(toDataKey('dyn:primary')), 3000)
   assert.equal(await redis.pttl(toDataKey('dyn:inherit')), 3000)
-  assert.equal(await redis.pttl(toDataKey('dyn:long')), 30_000)
-  // 0.2 * 3 * 1000 is 600.0000000000001 in floating point; ceil keeps Redis expiry at or after the header.
-  assert.equal(await redis.pttl(toDataKey('dyn:short')), 601)
+  assert.equal(await redis.pttl(toDataKey('dyn:long')), 12_000)
+  // (0.1 + 0.2) * 1000 is 300.00000000000006 in floating point; ceil keeps Redis expiry at or after the header.
+  assert.equal(await redis.pttl(toDataKey('dyn:short')), 301)
 
   // 2. Batch TTL overrides configured TTL without invoking callback and supplies secondary default
   const overrideCache = swr.cache({
     key: (id: string) => `override:${id}`,
-    staleMultiplier: 2,
+    stale: ({ ttl }) => ttl,
     ttl: () => {
       throw new Error('TTL callback should be skipped when batch.ttl is set')
     },
@@ -155,11 +156,12 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
     ['override:inherited', 10],
     ['override:explicit', 30],
   ] as const) {
+    // Every entry inherits the primary's resolved stale seconds (10).
     const env = decodeEnvelope<string>((await redis.getBuffer(toDataKey(key)))!)
     assert.equal(env.cachedAtMs, 1000)
     assert.equal(env.freshUntilMs, 1000 + ttl * 1000)
-    assert.equal(env.expiresAtMs, 1000 + ttl * 2000)
-    assert.equal(await redis.pttl(toDataKey(key)), ttl * 2000)
+    assert.equal(env.expiresAtMs, 1000 + (ttl + 10) * 1000)
+    assert.equal(await redis.pttl(toDataKey(key)), (ttl + 10) * 1000)
   }
 })
 
@@ -236,7 +238,7 @@ test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/mem
   for (const badTtl of badTtls) {
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
-    const swr = createSwrClient({ redis, memory: true, staleMultiplier: 2 })
+    const swr = createSwrClient({ redis, memory: true, stale: ({ ttl }) => ttl })
 
     const badBatchTtl = swr.cache({
       key: (id: string) => `bad-batch:${id}`,
