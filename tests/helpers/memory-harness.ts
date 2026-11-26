@@ -41,7 +41,7 @@ export function memoryHarness<T, Context = void>(
     redis: commands,
     keys: createRedisKeys(DEFAULTS.prefix),
     memory,
-    options: resolveClientOptions({ pollIntervalMs: 1, ...sharedOptions, memory: true }),
+    options: resolveClientOptions({ pollInterval: 0.001, ...sharedOptions, memory: true }),
     emit: createEventEmitter(onEvent),
   })
   const cache = new SwrCacheImpl<T, Context>(internals, options)

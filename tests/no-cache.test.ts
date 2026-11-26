@@ -51,7 +51,7 @@ test(
     const swr = createSwrClient({
       redis,
       ttl: 10,
-      pollIntervalMs: 5,
+      pollInterval: 0.005,
       onEvent: (e) => {
         if (e.type === 'miss' && e.action === 'wait') waiting.resolve()
       },
@@ -115,7 +115,7 @@ for (const stale of ['detached', 'inline', 'inline with waiter'] as const) {
         staleMultiplier: 10,
         runtime: stale === 'detached' ? 'server' : 'serverless',
         staleWait: stale === 'inline with waiter' ? 10 : 0,
-        pollIntervalMs: 5,
+        pollInterval: 0.005,
         onEvent: (event) => {
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiterStarted()
         },

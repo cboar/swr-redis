@@ -248,7 +248,7 @@ test('Header-first expiry check skips payload decoding for expired reads and sta
       trackedCodec,
     ),
   )
-  const swr = createSwrClient({ redis, staleWait: 10, pollIntervalMs: 1 })
+  const swr = createSwrClient({ redis, staleWait: 10, pollInterval: 0.001 })
   const expiredCache = swr.cache({
     key: 'expired',
     codec: trackedCodec,
@@ -380,7 +380,7 @@ for (const [path, fault, expectedEvents] of [
       redis,
       memory: true,
       staleWait: 10,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
       onEvent: (event) => events.push(event),
     }).cache({ key, codec, fetch: async () => `fetched-${++fetches}` })
 

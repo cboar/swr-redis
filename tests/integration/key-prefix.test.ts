@@ -21,7 +21,7 @@ test(
       redis,
       prefix: swrPrefix,
       ttl: 30,
-      pollIntervalMs: 5,
+      pollInterval: 0.005,
       onEvent: (event) => {
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },

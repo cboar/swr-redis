@@ -89,8 +89,8 @@ export interface SwrSharedOptions {
   compression?: SwrCompressionOption
   /** Fetch lock TTL in seconds, renewed while `fetch` runs. Controls how quickly a crashed fetcher is detected. Default: `3`. */
   lockTtl?: number
-  /** Base interval in milliseconds between poll checks while waiting (plus up to 30% jitter). Default: `80`. */
-  pollIntervalMs?: number
+  /** Base interval in seconds between poll checks while waiting (plus up to 30% jitter). Default: `0.08`. */
+  pollInterval?: number
   /** Predicate marking fetch errors that should throw instead of falling back to a stale value (only rejects a caller still waiting for the refresh). */
   isFatal?: (err: unknown) => boolean
 }

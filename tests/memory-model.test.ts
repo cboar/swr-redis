@@ -227,7 +227,7 @@ async function runOnce(
         lockTtl: 1,
         // Long enough that the schedule's mock-timer ticks never time out a fetch or a waiter.
         fetchTimeout: 3600,
-        pollIntervalMs: 1,
+        pollInterval: 0.001,
         ...STALE_HANDLING[stale],
         memory: true,
       }),

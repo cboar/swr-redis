@@ -352,7 +352,7 @@ test(
       redis,
       runtime: 'serverless',
       staleWait: 10,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
       onEvent: (event) => {
         if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
       },
@@ -395,7 +395,7 @@ test(
       redis,
       runtime: 'serverless',
       staleWait: 10,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
       onEvent: (event) => {
         if (event.type === 'poll') polls.push(event.outcome)
         if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
@@ -473,7 +473,7 @@ for (const { name, staleWait, fetchTimeout } of [
         redis,
         staleWait,
         fetchTimeout,
-        pollIntervalMs: 10,
+        pollInterval: 0.01,
         onEvent: (event) => {
           events.push(event)
           if (event.type === 'hit') waiting.resolve()
@@ -513,7 +513,7 @@ for (const role of ['winner', 'poller'] as const) {
       const cache = createSwrClient({
         redis,
         staleWait: role === 'winner' ? 0.5 : 10,
-        pollIntervalMs: 10,
+        pollInterval: 0.01,
         onEvent: (event) => {
           if (event.type === 'poll') polls.push(event.outcome)
           if (event.type === 'hit') waiting.resolve()

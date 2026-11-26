@@ -23,7 +23,7 @@ export const DEFAULTS = {
   staleWait: 0,
   failureCooldown: 1,
   lockTtl: 3,
-  pollIntervalMs: 80,
+  pollInterval: 0.08,
   compression: { level: 1, minBytes: 256 },
   memory: { maxEntries: 1_000, maxTtl: Infinity, clone: false },
 } as const
@@ -114,7 +114,7 @@ export function resolveCacheOptions<T, Context>(
       cache.failureCooldown ?? shared.failureCooldown ?? DEFAULTS.failureCooldown,
     ),
     lockTtlMs: toMs(cache.lockTtl ?? shared.lockTtl ?? DEFAULTS.lockTtl),
-    pollIntervalMs: cache.pollIntervalMs ?? shared.pollIntervalMs ?? DEFAULTS.pollIntervalMs,
+    pollIntervalMs: toMs(cache.pollInterval ?? shared.pollInterval ?? DEFAULTS.pollInterval),
     compression: resolveCompression(cache.compression ?? shared.compression),
     isFatal: cache.isFatal ?? shared.isFatal,
     codec: cache.codec ?? (client.codec as SwrCodec<T>),
@@ -165,7 +165,7 @@ function validateFields(layer: SwrSharedOptions) {
     staleWait,
     failureCooldown,
     lockTtl,
-    pollIntervalMs,
+    pollInterval,
     compression,
   } = layer
   const { level, minBytes } = typeof compression === 'object' ? compression : {}
@@ -192,10 +192,11 @@ function validateFields(layer: SwrSharedOptions) {
     isTimerSeconds,
     `lockTtl must be a positive number of at most ${MAX_TIMER_MS / 1000} seconds`,
   )
+  // Each poll sleep is also capped by the waiting limit, so jitter can't overflow the timer.
   check(
-    pollIntervalMs,
-    (v) => isPositiveSafeInteger(v) && maxPollDelayMs(v) <= MAX_TIMER_MS,
-    `pollIntervalMs must be a positive integer, with jitter at most ${MAX_TIMER_MS}`,
+    pollInterval,
+    isTimerSeconds,
+    `pollInterval must be a positive number of at most ${MAX_TIMER_MS / 1000} seconds`,
   )
   check(
     level,
@@ -248,10 +249,6 @@ function toNonNegativeMs(seconds: number) {
 
 function isTimerSeconds(seconds: number) {
   return isPositiveFinite(seconds) && toMs(seconds) <= MAX_TIMER_MS
-}
-
-function maxPollDelayMs(pollIntervalMs: number) {
-  return pollIntervalMs + Math.floor(pollIntervalMs * POLL_JITTER)
 }
 
 function isPositiveFinite(value: number) {

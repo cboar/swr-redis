@@ -13,9 +13,6 @@ import type { SwrSharedOptions } from '../src/types.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { useRedisClock } from './helpers/clock.ts'
 
-// Largest interval whose jittered sleep (p + floor(0.3p)) still fits a Node timer.
-const MAX_POLL_INTERVAL_MS = 1_651_910_498
-
 interface InvalidOptionCase {
   label: string
   options: SwrSharedOptions
@@ -64,12 +61,10 @@ const INVALID_OPTION_CASES: InvalidOptionCase[] = [
       expectedFragment: 'failureCooldown',
     }),
   ),
-  ...(
-    [0, -1, 1.5, NaN, Infinity, MAX_POLL_INTERVAL_MS + 1, Number.MAX_SAFE_INTEGER + 1] as const
-  ).map((pollIntervalMs) => ({
-    label: `pollIntervalMs=${String(pollIntervalMs)}`,
-    options: { pollIntervalMs },
-    expectedFragment: 'pollIntervalMs',
+  ...([0, -1, NaN, Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map((pollInterval) => ({
+    label: `pollInterval=${String(pollInterval)}`,
+    options: { pollInterval },
+    expectedFragment: 'pollInterval',
   })),
   ...([-1, 10, 1.5, NaN, Infinity] as const).map((level) => ({
     label: `compression.level=${String(level)}`,
@@ -220,7 +215,7 @@ test('Options validation: accepts valid boundary values on client and cache over
       fetchTimeout: 0.05,
       staleWait: 0,
       failureCooldown: 0,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
       compression: false,
     },
     {
@@ -237,7 +232,7 @@ test('Options validation: accepts valid boundary values on client and cache over
     },
     {
       compression: { level: 9, minBytes: Number.MAX_SAFE_INTEGER },
-      pollIntervalMs: MAX_POLL_INTERVAL_MS,
+      pollInterval: MAX_TIMER_MS / 1000,
       lockTtl: MAX_TIMER_MS / 1000,
       fetchTimeout: MAX_TIMER_MS / 1000,
       staleWait: Infinity,

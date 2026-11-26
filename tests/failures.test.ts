@@ -170,7 +170,7 @@ for (const stage of ['acquire', 'poll'] as const) {
       redis,
       staleWait: 10,
       failureStrategy: 'protect-source',
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({ key: 'redis-expiry', ttl: 1, staleMultiplier: 2, fetch: async () => 'fresh' })
     await cache.set(undefined, 'stale')
     redis.advanceTime(1000)
@@ -209,7 +209,7 @@ for (const failure of ['read', 'acquire', 'poll'] as const) {
         const cache = createSwrClient({
           redis,
           failureStrategy,
-          pollIntervalMs: 1,
+          pollInterval: 0.001,
           onEvent: (event) => events.push(event),
         }).cache({
           key: 'redis-failure',
@@ -281,7 +281,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
           redis,
           failureStrategy,
           staleWait: polling ? 10 : 0,
-          pollIntervalMs: 1,
+          pollInterval: 0.001,
           onEvent: (e) => events.push(e),
         }).cache<string | undefined>({
           key: 'stale-failure',
@@ -551,7 +551,7 @@ for (const phase of ['cold', 'stale'] as const) {
       const cache = createSwrClient({
         redis,
         staleWait: 10,
-        pollIntervalMs: 1,
+        pollInterval: 0.001,
         onEvent: (event) => {
           events.push(event)
           if (
@@ -604,7 +604,7 @@ for (const [phase, mgetOutcome] of [
       const cache = createSwrClient({
         redis,
         staleWait: 10,
-        pollIntervalMs: 1,
+        pollInterval: 0.001,
         onEvent: (event) => events.push(event),
       }).cache<string>({
         key,
@@ -669,7 +669,7 @@ for (const acquireOutcome of ['acquired', 'contended', 'lost_reply'] as const) {
       const cache = createSwrClient({
         redis,
         failureStrategy: 'availability',
-        pollIntervalMs: 1,
+        pollInterval: 0.001,
       }).cache<string>({
         key,
         ttl: 5,

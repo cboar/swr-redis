@@ -38,7 +38,7 @@ test(
     let fetches = 0
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
       onEvent: (event) => {
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },
@@ -96,7 +96,7 @@ test(
     const events: SwrEvent[] = []
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 10,
+      pollInterval: 0.01,
       onEvent: (event) => {
         events.push(event)
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
@@ -143,7 +143,7 @@ test(
     const events: SwrEvent[] = []
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 10,
+      pollInterval: 0.01,
       failureStrategy: 'protect-source',
       onEvent: (event) => {
         events.push(event)
@@ -195,7 +195,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
         redis,
         failureStrategy,
         fetchTimeout: 0.03,
-        pollIntervalMs: 10,
+        pollInterval: 0.01,
         onEvent: (event) => {
           events.push(event)
           if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
@@ -245,7 +245,7 @@ for (const recovers of [true, false]) {
         redis,
         fetchTimeout: 0.08,
         failureCooldown: 0.05,
-        pollIntervalMs: 10,
+        pollInterval: 0.01,
         onEvent: (event) => {
           events.push(event)
           if (event.type === 'miss' && event.action === 'wait' && ++waiters === 2) {
@@ -357,7 +357,7 @@ for (const { name, freshUntilMs, expiresAtMs, accepted, inMemory } of [
     const cache = createSwrClient({
       redis,
       memory: true,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({
       key: 'deadline',
       ttl: () => assert.fail('read must not resolve reader TTL'),
@@ -403,7 +403,7 @@ test(
     const cache = createSwrClient({
       redis,
       memory: { maxTtl: 1 },
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({
       key: 'cap',
       ttl: () => assert.fail('read TTL'),
@@ -441,7 +441,7 @@ for (const { name, freshUntilMs, expected } of [
     const cache = createSwrClient({
       redis,
       staleWait: 10,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({
       key,
       ttl: () => assert.fail('stored deadlines bypass reader TTL'),
@@ -496,7 +496,7 @@ for (const scenario of ['timeout', 'unlocked'] as const) {
       const cache = createSwrClient({
         redis,
         staleWait: 0.03,
-        pollIntervalMs: scenario === 'timeout' ? 10 : 1,
+        pollInterval: scenario === 'timeout' ? 0.01 : 0.001,
         onEvent: (event) => {
           events.push(event)
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
@@ -533,7 +533,7 @@ test(
     const waiting = Promise.withResolvers<void>()
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 100,
+      pollInterval: 0.1,
       onEvent: (event) => {
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },

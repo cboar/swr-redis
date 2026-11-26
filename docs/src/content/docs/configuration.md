@@ -10,7 +10,7 @@ them. Examples build on `redis`, `swr`, and `userCache` from
 
 ## Options
 
-Durations are in seconds, except `pollIntervalMs`, which is in milliseconds.
+Durations are in seconds.
 
 | Option | Set on | Description |
 | --- | --- | --- |
@@ -30,7 +30,7 @@ Durations are in seconds, except `pollIntervalMs`, which is in milliseconds.
 | `lockTtl` | Client, cache | Initial fetch lock TTL, renewed automatically while `fetch` runs. Default: `3`. |
 | `maxLockTtl` | Client, cache | Maximum duration a single fetch keeps renewing its lock. Default: `max(30, lockTtl)`. |
 | `waitTimeout` | Client, cache | Time budget for polling while another caller holds the lock. Default: `10`. |
-| `pollIntervalMs` | Client, cache | Base interval between poll checks while waiting. Default: `80`. |
+| `pollInterval` | Client, cache | Base interval between poll checks while waiting, plus up to 30% jitter. Default: `0.08`. |
 | `isFatal` | Client, cache | Predicate marking fetch errors that should throw instead of falling back to a stale value. |
 | `onEvent` | Client | Telemetry callback. See [observability](/swr-redis/observability/). |
 | `waitUntil` | Client, `get()` | Serverless lifecycle hook for background `'swr'` refreshes. A per-call hook overrides the client hook. |
@@ -99,7 +99,7 @@ const userFromRedis = await userCache.get('u_123', { memory: false })
 
 For slow fetches, increase `maxLockTtl` to allow lock renewal for longer.
 Increase `waitTimeout` if callers should wait longer for a shared result.
-A longer `pollIntervalMs` reduces Redis reads and can delay when waiting
+A longer `pollInterval` reduces Redis reads and can delay when waiting
 callers see the result. The final poll can finish after the budget expires and
 return a cached value or take over an available lock on a cold miss.
 

@@ -23,7 +23,7 @@ test(
       redis,
       ttl: 5,
       staleMultiplier: 6,
-      pollIntervalMs: 15,
+      pollInterval: 0.015,
       onEvent: (event: SwrEvent) => {
         if (event.type === 'miss' && event.action === 'wait' && ++waiters === 49)
           allWaiting.resolve()
@@ -87,7 +87,7 @@ for (const phase of ['cold', 'stale'] as const) {
       const options = {
         redis,
         failureCooldown: cooldownMs / 1000,
-        pollIntervalMs: 15,
+        pollInterval: 0.015,
         staleWait: Infinity,
         onEvent: (event: SwrEvent) => {
           if (event.type === 'miss' && event.action === 'wait') waits.push(event.key)

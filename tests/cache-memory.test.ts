@@ -189,7 +189,7 @@ function optOutClient(
     redis,
     memory: true,
     runtime: 'serverless',
-    pollIntervalMs: 1,
+    pollInterval: 0.001,
     ...options,
   })
   const getOptions = scope === 'request' ? { memory: false as const } : undefined
@@ -515,7 +515,7 @@ test('Memory clone: a populate clone error propagates on the initial read and on
     const { redis, cache } = memoryHarness<Record<string, unknown>>(
       t,
       { key: 'read-clone', codec, fetch: async () => assert.fail('must not fetch') },
-      { pollIntervalMs: 5 },
+      { pollInterval: 0.005 },
       createLruMemory({ clone: true }),
     )
     const envelope = encodeEnvelope(
@@ -814,7 +814,7 @@ test('Memory: a cold-poll MGET failure releases read tracking before the direct 
         return 'direct'
       },
     },
-    { pollIntervalMs: 5 },
+    { pollInterval: 0.005 },
   )
   await redis.set(toLockKey('poll-err'), 'other-owner', 'PX', 5000)
   const mgetBuffer = redis.mgetBuffer.bind(redis)
