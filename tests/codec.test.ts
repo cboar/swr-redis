@@ -4,6 +4,7 @@ import { ObjectId } from 'bson'
 import { createSwrClient, SwrWriteBatch, type SwrCodec, type SwrEvent } from '../src/index.ts'
 import { ENVELOPE_HEADER_SIZE, readEnvelopeHeader } from '../src/codec.ts'
 import { createRedisKeys } from '../src/keys.ts'
+import { COOLDOWN_MARKER } from '../src/lock.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { decodeEnvelope, encodeEnvelope } from './helpers/envelope.ts'
@@ -187,14 +188,15 @@ test('Codecs: a cache codec overrides the client codec, which overrides BSON', a
   assert.deepEqual(await mapCache.get('a'), new Map([['a', 7]]))
 })
 
-test('Custom codec encoding failure releases the lock without populating Redis or memory', async () => {
-  const redis = createFakeRedis()
+test('Custom codec encoding failure starts a cooldown without populating Redis or memory', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
   const { data: dataKey, lock: lockKey } = createRedisKeys(DEFAULTS.prefix)
   const failure = new Error('Cannot encode')
   const swr = createSwrClient({ redis, memory: true })
-  const fallbackReader = swr.cache({
+  const reader = swr.cache({
     key: 'primary',
-    fetch: async () => 'fallback-primary',
+    fetch: async () => assert.fail('reader must not fetch'),
   })
   const cache = swr.cache({
     key: 'primary',
@@ -207,9 +209,14 @@ test('Custom codec encoding failure releases the lock without populating Redis o
     fetch: async () => 'ok',
   })
   await assert.rejects(cache.get(), (error) => error === failure)
-  assert.equal(await redis.get(lockKey('primary')), null)
+  assert.equal(await redis.get(lockKey('primary')), COOLDOWN_MARKER)
   assert.equal(await redis.getBuffer(dataKey('primary')), null)
-  assert.equal(await fallbackReader.get(), 'fallback-primary')
+  // Memory holds nothing, so a reader sees a value written straight to Redis.
+  await redis.set(
+    dataKey('primary'),
+    encodeEnvelope({ value: 'redis', cachedAtMs: 1000, freshUntilMs: 5000, expiresAtMs: 10_000 }),
+  )
+  assert.equal(await reader.get(), 'redis')
 })
 
 test('Envelope decoding surfaces payload and inflate errors', () => {
@@ -241,7 +248,7 @@ test('Header-first expiry check skips payload decoding for expired reads and sta
       trackedCodec,
     ),
   )
-  const swr = createSwrClient({ redis, mode: 'wait-on-stale', pollIntervalMs: 1 })
+  const swr = createSwrClient({ redis, staleWait: 10, pollInterval: 0.001 })
   const expiredCache = swr.cache({
     key: 'expired',
     codec: trackedCodec,
@@ -305,7 +312,7 @@ test('Synchronous decoder crossing deadlines keeps the pre-decode read admission
       slowCodec,
     ),
   )
-  const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache({
+  const cache = createSwrClient({ redis }).cache({
     key: 'slow-fresh',
     codec: slowCodec,
     fetch: async () => assert.fail('must not fetch when header was fresh before decode'),
@@ -372,8 +379,8 @@ for (const [path, fault, expectedEvents] of [
     const cache = createSwrClient({
       redis,
       memory: true,
-      mode: 'wait-on-stale',
-      pollIntervalMs: 1,
+      staleWait: 10,
+      pollInterval: 0.001,
       onEvent: (event) => events.push(event),
     }).cache({ key, codec, fetch: async () => `fetched-${++fetches}` })
 

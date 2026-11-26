@@ -2,6 +2,8 @@ import type { Redis } from 'ioredis'
 import {
   ACQUIRE_LOCK_SCRIPT,
   COMMIT_AND_RELEASE_SCRIPT,
+  COOLDOWN_LOCK_SCRIPT,
+  COOLDOWN_MARKER,
   EXTEND_LOCK_SCRIPT,
   RELEASE_LOCK_SCRIPT,
   SET_AND_CLEAR_LOCK_SCRIPT,
@@ -156,9 +158,18 @@ export class FakeRedis {
       case ACQUIRE_LOCK_SCRIPT: {
         const lockKey = keys[0]!
         const token = String(argv[0])
-        const current = this.cleanExpired(lockKey)
-        if (current && current.value.toString('utf-8') !== token) return '0'
+        const owner = this.cleanExpired(lockKey)?.value.toString('utf-8')
+        if (owner === COOLDOWN_MARKER) return 'cooldown'
+        if (owner !== undefined && owner !== token) return 'busy'
         this.storeValue(lockKey, token, 'PX', argv[1])
+        return 'acquired'
+      }
+
+      case COOLDOWN_LOCK_SCRIPT: {
+        const lockKey = keys[0]!
+        const current = this.cleanExpired(lockKey)
+        if (!current || current.value.toString('utf-8') !== String(argv[0])) return '0'
+        this.storeValue(lockKey, COOLDOWN_MARKER, 'PX', argv[1])
         return '1'
       }
 
@@ -184,11 +195,11 @@ export class FakeRedis {
         for (let i = 1; i < keys.length; i++) {
           const dataKey = keys[i]!
           const value = argv[i * 2 - 1]
-          const ttlSeconds = argv[i * 2]
-          if (value === undefined || ttlSeconds === undefined) {
+          const ttlMs = argv[i * 2]
+          if (value === undefined || ttlMs === undefined) {
             throw new Error("ERR wrong number of arguments for 'set' command")
           }
-          this.storeValue(dataKey, value, 'EX', Number(ttlSeconds))
+          this.storeValue(dataKey, value, 'PX', Number(ttlMs))
         }
         this.removeKeys(lockKey)
         return '1'
@@ -198,8 +209,7 @@ export class FakeRedis {
         const dataKey = keys[0]!
         const lockKey = keys[1]!
         const buf = argv[0]
-        const ttlSeconds = Number(argv[1])
-        this.storeValue(dataKey, buf, 'EX', ttlSeconds)
+        this.storeValue(dataKey, buf, 'PX', Number(argv[1]))
         this.removeKeys(lockKey)
         return '1'
       }

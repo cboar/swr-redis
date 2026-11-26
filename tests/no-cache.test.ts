@@ -51,8 +51,7 @@ test(
     const swr = createSwrClient({
       redis,
       ttl: 10,
-      pollIntervalMs: 5,
-      waitTimeout: 1,
+      pollInterval: 0.005,
       onEvent: (e) => {
         if (e.type === 'miss' && e.action === 'wait') waiting.resolve()
       },
@@ -96,9 +95,11 @@ test(
   },
 )
 
-for (const mode of ['swr', 'swr-serverless', 'wait-on-stale'] as const) {
+// Detached: the winner returns stale. Inline: the winner waits for its refresh. Waiter: a second
+// stale caller polls for the refresh.
+for (const stale of ['detached', 'inline', 'inline with waiter'] as const) {
   test(
-    `SwrNoCache: ${mode} preserves stale data and returns the appropriate caller values`,
+    `SwrNoCache: a stale refresh (${stale}) keeps the stale entry and releases the lock without a cooldown`,
     { timeout: 5000 },
     async (t) => {
       const redis = createFakeRedis(1000)
@@ -112,8 +113,9 @@ for (const mode of ['swr', 'swr-serverless', 'wait-on-stale'] as const) {
         memory: true,
         ttl: 1,
         staleMultiplier: 10,
-        mode,
-        pollIntervalMs: 5,
+        runtime: stale === 'detached' ? 'server' : 'serverless',
+        staleWait: stale === 'inline with waiter' ? 10 : 0,
+        pollInterval: 0.005,
         onEvent: (event) => {
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiterStarted()
         },
@@ -143,12 +145,12 @@ for (const mode of ['swr', 'swr-serverless', 'wait-on-stale'] as const) {
       redis.advanceTime(1500)
       const winner = cache.get()
       await entered
-      const waiter = mode === 'wait-on-stale' ? cache.get() : undefined
+      const waiter = stale === 'inline with waiter' ? cache.get() : undefined
       if (waiter) await waiting
-      if (mode === 'swr') assert.equal(await winner, 'stored')
+      if (stale === 'detached') assert.equal(await winner, 'stored')
       releaseFetch()
 
-      assert.equal(await winner, mode === 'swr' ? 'stored' : 'transient')
+      assert.equal(await winner, stale === 'detached' ? 'stored' : 'transient')
       if (waiter) assert.equal(await waiter, 'stored')
       await swr.flush()
       assert.equal(calls, 2)

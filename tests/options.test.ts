@@ -1,15 +1,17 @@
 import { decodeEnvelope } from './helpers/envelope.ts'
 import { createRedisKeys } from '../src/keys.ts'
-import { DEFAULTS, MAX_TIMER_MS } from '../src/options.ts'
+import {
+  DEFAULTS,
+  MAX_TIMER_MS,
+  resolveCacheOptions,
+  resolveClientOptions,
+} from '../src/options.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createSwrClient, SwrValidationError } from '../src/index.ts'
 import type { SwrSharedOptions } from '../src/types.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { useRedisClock } from './helpers/clock.ts'
-
-// Largest interval whose jittered sleep (p + floor(0.3p)) still fits a Node timer.
-const MAX_POLL_INTERVAL_MS = 1_651_910_498
 
 interface InvalidOptionCase {
   label: string
@@ -40,31 +42,29 @@ const INVALID_OPTION_CASES: InvalidOptionCase[] = [
     options: { lockTtl },
     expectedFragment: 'lockTtl',
   })),
-  ...([0, -1, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER / 1000 + 1] as const).map(
-    (maxLockTtl) => ({
-      label: `maxLockTtl=${String(maxLockTtl)}`,
-      options: { maxLockTtl },
-      expectedFragment: 'maxLockTtl',
+  ...([0, -1, NaN, Infinity, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map(
+    (fetchTimeout) => ({
+      label: `fetchTimeout=${String(fetchTimeout)}`,
+      options: { fetchTimeout },
+      expectedFragment: 'fetchTimeout',
     }),
   ),
-  {
-    label: 'same-layer maxLockTtl < lockTtl',
-    options: { lockTtl: 10, maxLockTtl: 5 },
-    expectedFragment: 'maxLockTtl',
-  },
-  ...([0, -1, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER / 1000 + 1] as const).map(
-    (waitTimeout) => ({
-      label: `waitTimeout=${String(waitTimeout)}`,
-      options: { waitTimeout },
-      expectedFragment: 'waitTimeout',
+  ...([-1, NaN, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map((staleWait) => ({
+    label: `staleWait=${String(staleWait)}`,
+    options: { staleWait },
+    expectedFragment: 'staleWait',
+  })),
+  ...([-1, NaN, Infinity, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map(
+    (failureCooldown) => ({
+      label: `failureCooldown=${String(failureCooldown)}`,
+      options: { failureCooldown },
+      expectedFragment: 'failureCooldown',
     }),
   ),
-  ...(
-    [0, -1, 1.5, NaN, Infinity, MAX_POLL_INTERVAL_MS + 1, Number.MAX_SAFE_INTEGER + 1] as const
-  ).map((pollIntervalMs) => ({
-    label: `pollIntervalMs=${String(pollIntervalMs)}`,
-    options: { pollIntervalMs },
-    expectedFragment: 'pollIntervalMs',
+  ...([0, -1, NaN, Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map((pollInterval) => ({
+    label: `pollInterval=${String(pollInterval)}`,
+    options: { pollInterval },
+    expectedFragment: 'pollInterval',
   })),
   ...([-1, 10, 1.5, NaN, Infinity] as const).map((level) => ({
     label: `compression.level=${String(level)}`,
@@ -119,56 +119,6 @@ test('Options validation: rejects empty prefixes, cache names, and keys', async 
   await redis.unlink(keys.data('a'))
   await assert.rejects(withMemory.invalidateKeys('a', ''), rejects('key'))
   assert.equal(await a.get(), 'kept')
-})
-
-test('Options validation: enforces merged cross-layer maxLockTtl >= lockTtl in both directions', () => {
-  const redis = createFakeRedis()
-
-  const clientWithHighLockTtl = createSwrClient({ redis, lockTtl: 10 })
-  assert.throws(
-    () =>
-      clientWithHighLockTtl.cache({
-        key: 'cross-1',
-        maxLockTtl: 5,
-        fetch: async () => 'v',
-      }),
-    (err: unknown) => err instanceof SwrValidationError && err.message.includes('maxLockTtl'),
-  )
-  clientWithHighLockTtl.cache({
-    key: 'cross-1-eq',
-    maxLockTtl: 10,
-    fetch: async () => 'v',
-  })
-
-  const clientWithLowMaxLockTtl = createSwrClient({ redis, maxLockTtl: 5 })
-  assert.throws(
-    () =>
-      clientWithLowMaxLockTtl.cache({
-        key: 'cross-2',
-        lockTtl: 10,
-        fetch: async () => 'v',
-      }),
-    (err: unknown) => err instanceof SwrValidationError && err.message.includes('maxLockTtl'),
-  )
-  clientWithLowMaxLockTtl.cache({
-    key: 'cross-2-eq',
-    lockTtl: 5,
-    fetch: async () => 'v',
-  })
-
-  // A client maxLockTtl below the default lockTtl stays valid for caches that lower lockTtl.
-  createSwrClient({ redis, maxLockTtl: 2 }).cache({
-    key: 'cross-3',
-    lockTtl: 2,
-    fetch: async () => 'v',
-  })
-
-  // lockTtl exceeding default ceiling (30s) without explicit maxLockTtl uses Math.max(30, lockTtl)
-  const clientWithLongLockTtl = createSwrClient({ redis, lockTtl: 45 })
-  clientWithLongLockTtl.cache({
-    key: 'cross-default-max',
-    fetch: async () => 'v',
-  })
 })
 
 test('Options validation: enforces merged cross-layer resolved Redis TTL ceiling', () => {
@@ -262,9 +212,10 @@ test('Options validation: accepts valid boundary values on client and cache over
       ttl: 0.1,
       staleMultiplier: 1,
       lockTtl: 0.05,
-      maxLockTtl: 0.05,
-      waitTimeout: 0.05,
-      pollIntervalMs: 1,
+      fetchTimeout: 0.05,
+      staleWait: 0,
+      failureCooldown: 0,
+      pollInterval: 0.001,
       compression: false,
     },
     {
@@ -281,10 +232,11 @@ test('Options validation: accepts valid boundary values on client and cache over
     },
     {
       compression: { level: 9, minBytes: Number.MAX_SAFE_INTEGER },
-      pollIntervalMs: MAX_POLL_INTERVAL_MS,
+      pollInterval: MAX_TIMER_MS / 1000,
       lockTtl: MAX_TIMER_MS / 1000,
-      maxLockTtl: Math.floor(Number.MAX_SAFE_INTEGER / 1000),
-      waitTimeout: Math.floor(Number.MAX_SAFE_INTEGER / 1000),
+      fetchTimeout: MAX_TIMER_MS / 1000,
+      staleWait: Infinity,
+      failureCooldown: MAX_TIMER_MS / 1000,
     },
   ]
 
@@ -336,4 +288,48 @@ test('Options inheritance: numeric client TTL and per-cache dynamic override set
     assert.equal(stored.freshUntilMs, freshUntilMs)
     assert.equal(stored.expiresAtMs, freshUntilMs)
   }
+})
+
+test('Options validation: a per-call staleWait is validated even when memory would serve the call', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  const cache = createSwrClient({ redis, memory: true }).cache({
+    key: 'per-call',
+    fetch: async () => 'value',
+  })
+  assert.equal(await cache.get(), 'value')
+  for (const staleWait of [-1, NaN, -Infinity, MAX_TIMER_MS / 1000 + 0.001]) {
+    await assert.rejects(
+      cache.get(undefined, { staleWait }),
+      (err: unknown) => err instanceof SwrValidationError && err.message.includes('staleWait'),
+      `staleWait=${staleWait}`,
+    )
+  }
+  for (const staleWait of [0, 0.5, Infinity]) {
+    assert.equal(await cache.get(undefined, { staleWait }), 'value')
+  }
+})
+
+test('Options inheritance: timing fields merge independently, and zero disables staleWait and failureCooldown', () => {
+  const client = resolveClientOptions({ fetchTimeout: 5, staleWait: 0.25, failureCooldown: 0 })
+  const cache = resolveCacheOptions(client, {
+    key: 'k',
+    fetch: async () => 'v',
+    staleWait: 0,
+    lockTtl: 0.5,
+  })
+  assert.equal(cache.fetchTimeoutMs, 5000)
+  assert.equal(cache.staleWaitMs, 0)
+  assert.equal(cache.failureCooldownMs, 0)
+  assert.equal(cache.lockTtlMs, 500)
+
+  const defaults = resolveCacheOptions(resolveClientOptions({}), {
+    key: 'k',
+    fetch: async () => 'v',
+    staleWait: Infinity,
+  })
+  assert.equal(defaults.fetchTimeoutMs, DEFAULTS.fetchTimeout * 1000)
+  assert.equal(defaults.staleWaitMs, Infinity)
+  assert.equal(defaults.failureCooldownMs, DEFAULTS.failureCooldown * 1000)
+  assert.equal(defaults.lockTtlMs, DEFAULTS.lockTtl * 1000)
 })

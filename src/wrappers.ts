@@ -1,4 +1,4 @@
-import type { SwrWriteBatchInput } from './types.ts'
+import type { SwrCacheWrite, SwrWriteBatchInput } from './types.ts'
 
 /** Return from `fetch` to deliver `value` to the caller without writing to Redis or memory. */
 export class SwrNoCache<T> {
@@ -15,7 +15,7 @@ export class SwrWriteBatch<T> {
   declare private readonly _brand: void
   readonly primary: T
   readonly ttl?: number
-  readonly secondary: NonNullable<SwrWriteBatchInput<T>['secondary']>
+  readonly secondary: readonly SwrCacheWrite[]
 
   constructor(input: SwrWriteBatchInput<T>) {
     this.primary = input.primary

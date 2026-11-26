@@ -1,11 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createSwrClient, SwrValidationError, SwrWriteBatch, type SwrEvent } from '../src/index.ts'
+import {
+  createSwrClient,
+  SwrTimeoutError,
+  SwrValidationError,
+  SwrWriteBatch,
+  type SwrEvent,
+} from '../src/index.ts'
 import { registerLockCommands } from '../src/lock.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createFakeRedis } from './fake-redis.ts'
-import { useRedisClock } from './helpers/clock.ts'
+import { tick, useRedisClock } from './helpers/clock.ts'
 
 const { lock: toLockKey } = createRedisKeys(DEFAULTS.prefix)
 
@@ -21,7 +27,7 @@ test('Events: read paths emit hit, miss, and refresh, stamped with the cache nam
   const swr = createSwrClient({
     redis,
     memory: true,
-    mode: 'swr-serverless',
+    runtime: 'serverless',
     onEvent,
   })
   const named = swr.cache({
@@ -98,10 +104,12 @@ test('Events: error reasons and severities', { timeout: 5000 }, async (t) => {
     throw new Error('boom')
   }
 
-  // In 'swr' mode stale refresh failures only differ by event: transient vs fatal (built-in or isFatal).
+  // With staleWait 0, stale refresh failures only differ by event: transient vs fatal (built-in or
+  // isFatal). A SwrTimeoutError from a nested cache is an ordinary failure.
   class CustomFatal extends Error {}
   for (const [failure, expected] of [
     [new Error('transient'), 'stale_fallback:warn:refresh'],
+    [new SwrTimeoutError('nested', 1, 'fetch'), 'stale_fallback:warn:refresh'],
     [new CustomFatal('schema mismatch'), 'fatal:error'],
     [new SwrValidationError('contract violation'), 'fatal:error'],
   ] as const) {
@@ -123,6 +131,44 @@ test('Events: error reasons and severities', { timeout: 5000 }, async (t) => {
       [expected],
     )
   }
+
+  // A fetchTimeout is a warning when stale data is served instead, whether or not a caller waits.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  for (const [phase, expected] of [
+    ['cold', 'timeout:error'],
+    ['stale', 'timeout:warn'],
+  ] as const) {
+    assert.deepEqual(
+      await errors(async (redis, onEvent) => {
+        const entered = Promise.withResolvers<void>()
+        const swr = createSwrClient({ redis, onEvent, fetchTimeout: 1 })
+        const cache = swr.cache<string>({
+          key: 'k',
+          ttl: 1,
+          fetch: (_ctx, { signal }) => {
+            entered.resolve()
+            return new Promise((_resolve, reject) => {
+              signal.addEventListener('abort', () => reject(signal.reason))
+            })
+          },
+        })
+        if (phase === 'stale') {
+          await cache.set(undefined, 'stale')
+          redis.advanceTime(1500)
+        }
+        const result =
+          phase === 'cold'
+            ? assert.rejects(cache.get(), SwrTimeoutError)
+            : cache.get().then((value) => assert.equal(value, 'stale'))
+        await entered.promise
+        await tick(t, redis, 1000)
+        await result
+        await swr.flush()
+      }),
+      [expected],
+    )
+  }
+  t.mock.timers.reset()
 
   assert.deepEqual(
     await errors((redis, onEvent) => {
@@ -215,7 +261,7 @@ test('Events: heartbeat renewal failures emit lock_renewal_failure stamped with 
     throw new Error('renew failed')
   }
   const { events, onEvent } = recorder()
-  const cache = createSwrClient({ redis, onEvent, lockTtl: 0.02, maxLockTtl: 1 }).cache({
+  const cache = createSwrClient({ redis, onEvent, lockTtl: 0.02 }).cache({
     name: 'slow',
     key: 'renew',
     fetch: async () => {

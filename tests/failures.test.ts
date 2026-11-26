@@ -1,58 +1,63 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { setImmediate } from 'node:timers/promises'
 import {
   createSwrClient,
   SwrNoCache,
   SwrRedisError,
+  SwrTimeoutError,
   SwrWriteBatch,
-  type SwrCodec,
   type SwrEvent,
 } from '../src/index.ts'
-import { registerLockCommands } from '../src/lock.ts'
+import { COOLDOWN_MARKER, registerLockCommands } from '../src/lock.ts'
 import { failAcquire, interceptAcquire, type Acquire } from './helpers/acquire.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { gateCommand } from './helpers/command-gate.ts'
 import { encodeEnvelope } from './helpers/envelope.ts'
-import { useRedisClock } from './helpers/clock.ts'
+import { tick, useRedisClock } from './helpers/clock.ts'
+import { memoryHarness } from './helpers/memory-harness.ts'
 
 const { data: toDataKey, lock: toLockKey } = createRedisKeys(DEFAULTS.prefix)
 
-for (const releaseFails of [false, true]) {
+for (const swapFails of [false, true]) {
   test(
-    `Cold fetch failure rethrows the upstream error${releaseFails ? ' even when lock release fails' : ' and releases the lock'}`,
+    `Cold fetch failure rethrows the upstream error and ${swapFails ? 'reports a failed cooldown swap' : 'starts a cooldown'}`,
     { timeout: 5000 },
     async (t) => {
       const redis = createFakeRedis(1000)
       useRedisClock(t, redis)
       const failure = new Error('Database down')
-      const releaseFailure = new Error('Redis connection lost during release')
+      const swapFailure = new Error('Redis connection lost during the cooldown swap')
       const events: SwrEvent[] = []
-      if (releaseFails) {
-        registerLockCommands(redis).swrReleaseLock = async () => {
-          throw releaseFailure
+      if (swapFails) {
+        registerLockCommands(redis).swrCooldownLock = async () => {
+          throw swapFailure
         }
       }
+      let fetches = 0
       const cache = createSwrClient({ redis, onEvent: (event) => events.push(event) }).cache({
         key: 'cold-fail',
         fetch: async () => {
+          fetches++
           throw failure
         },
       })
       await assert.rejects(cache.get(), (error) => error === failure)
-      if (!releaseFails) assert.equal(await redis.get(toLockKey('cold-fail')), null)
+      assert.equal(fetches, 1)
+      if (!swapFails) assert.equal(await redis.get(toLockKey('cold-fail')), COOLDOWN_MARKER)
       assert.deepEqual(
         events.filter((event) => event.type === 'error'),
         [
-          ...(releaseFails
+          ...(swapFails
             ? [
                 {
                   type: 'error',
                   key: 'cold-fail',
                   reason: 'lock_release_failure',
                   severity: 'warn',
-                  err: releaseFailure,
+                  err: swapFailure,
                 },
               ]
             : []),
@@ -70,14 +75,14 @@ for (const releaseFails of [false, true]) {
 }
 
 test(
-  'Stale fallback returns an unexpired snapshot even when lock release fails',
+  'Stale fallback returns an unexpired snapshot even when the cooldown swap fails',
   { timeout: 5000 },
   async (t) => {
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
     const cmds = registerLockCommands(redis)
     let calls = 0
-    const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache({
+    const cache = createSwrClient({ redis, runtime: 'serverless' }).cache({
       key: 'stale-release',
       ttl: 5,
       fetch: async () => {
@@ -88,10 +93,11 @@ test(
     })
     assert.equal(await cache.get(), 'initial')
     redis.advanceTime(7_000)
-    cmds.swrReleaseLock = async () => {
-      throw new Error('Redis connection lost during release')
+    cmds.swrCooldownLock = async () => {
+      throw new Error('Redis connection lost during the cooldown swap')
     }
     assert.equal(await cache.get(), 'initial')
+    assert.equal(calls, 2)
   },
 )
 
@@ -125,15 +131,22 @@ test(
   },
 )
 
-test('Inline refresh propagates the fetch error when the snapshot expires', async (t) => {
+test('Inline refresh propagates the fetch error when the snapshot expires during the fetch', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const failure = new Error('upstream unavailable')
-  const cache = createSwrClient({ redis, mode: 'swr-serverless' }).cache<string>({
+  const events: SwrEvent[] = []
+  let fetches = 0
+  const cache = createSwrClient({
+    redis,
+    runtime: 'serverless',
+    onEvent: (event) => events.push(event),
+  }).cache<string>({
     key: 'inline-expiry',
     ttl: 1,
     staleMultiplier: 2,
     fetch: async () => {
+      fetches++
       redis.advanceTime(1000)
       throw failure
     },
@@ -141,6 +154,12 @@ test('Inline refresh propagates the fetch error when the snapshot expires', asyn
   await cache.set(undefined, 'stale')
   redis.advanceTime(1000)
   await assert.rejects(cache.get(), (err) => err === failure)
+  assert.equal(fetches, 1)
+  // The refresh judges its own outcome when it settles, by which time no stale value is usable.
+  assert.deepEqual(
+    events.flatMap((e) => (e.type === 'error' ? [`${e.reason}:${e.severity}`] : [])),
+    ['fetch_cold_failure:error'],
+  )
 })
 
 for (const stage of ['acquire', 'poll'] as const) {
@@ -149,9 +168,9 @@ for (const stage of ['acquire', 'poll'] as const) {
     useRedisClock(t, redis)
     const cache = createSwrClient({
       redis,
-      mode: 'wait-on-stale',
+      staleWait: 10,
       failureStrategy: 'protect-source',
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({ key: 'redis-expiry', ttl: 1, staleMultiplier: 2, fetch: async () => 'fresh' })
     await cache.set(undefined, 'stale')
     redis.advanceTime(1000)
@@ -190,7 +209,7 @@ for (const failure of ['read', 'acquire', 'poll'] as const) {
         const cache = createSwrClient({
           redis,
           failureStrategy,
-          pollIntervalMs: 1,
+          pollInterval: 0.001,
           onEvent: (event) => events.push(event),
         }).cache({
           key: 'redis-failure',
@@ -261,8 +280,8 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
         const cache = createSwrClient({
           redis,
           failureStrategy,
-          mode: polling ? 'wait-on-stale' : 'swr',
-          pollIntervalMs: 1,
+          staleWait: polling ? 10 : 0,
+          pollInterval: 0.001,
           onEvent: (e) => events.push(e),
         }).cache<string | undefined>({
           key: 'stale-failure',
@@ -274,7 +293,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
         const failure = new Error('Redis unavailable')
         if (!polling) {
           interceptAcquire(redis, async (acquire, ...args) => {
-            assert.equal(await acquire(...args), true)
+            assert.equal(await acquire(...args), 'acquired')
             throw failure
           })
         } else {
@@ -377,14 +396,16 @@ test(
   },
 )
 
-test('flush handles a rejected background refresh without an unhandled cleanup promise', async (t) => {
+test('A throwing isFatal in a background refresh reports fatal without rejecting the tracked refresh', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const failure = new Error('classification failed')
+  const events: SwrEvent[] = []
   let tracked: Promise<unknown> | undefined
   const swr = createSwrClient({
     redis,
     ttl: 2,
+    onEvent: (event) => events.push(event),
     isFatal() {
       throw failure
     },
@@ -402,75 +423,123 @@ test('flush handles a rejected background refresh without an unhandled cleanup p
   redis.advanceTime(3000)
   assert.equal(await cache.get(), 'original')
   assert.ok(tracked)
-  await assert.rejects(tracked, (err) => err === failure)
+  await tracked
   await swr.flush()
-  await new Promise<void>((resolve) => setImmediate(resolve))
-  assert.equal(await redis.get(toLockKey('bg-reject-inflight')), null)
+  assert.equal(await redis.get(toLockKey('bg-reject-inflight')), COOLDOWN_MARKER)
+  assert.deepEqual(
+    events.filter((e) => e.type === 'error'),
+    [
+      {
+        type: 'error',
+        reason: 'fatal',
+        severity: 'error',
+        key: 'bg-reject-inflight',
+        err: failure,
+      },
+    ],
+  )
 })
 
-test(
-  'AbortSignal: pre-aborted get rejects with the original reason before Redis I/O',
-  { timeout: 5000 },
-  async () => {
-    const redis = createFakeRedis()
-    redis.getBuffer = async () => assert.fail('pre-aborted get must not read Redis')
-    redis.eval = async () => assert.fail('pre-aborted get must not run a script')
-    const cache = createSwrClient({ redis }).cache({
-      key: 'pre-abort',
-      fetch: async () => assert.fail('pre-aborted fetch'),
-    })
-    const reason = new Error('already aborted')
-    await assert.rejects(
-      cache.get(undefined, { signal: AbortSignal.abort(reason) }),
-      (error) => error === reason,
-    )
-  },
-)
-
-for (const phase of ['cold', 'stale'] as const) {
+for (const memory of ['cold', 'warm'] as const) {
   test(
-    `AbortSignal: cooperative ${phase} inline fetch releases its lock`,
-    { timeout: 2000 },
-    async (t) => {
-      const redis = createFakeRedis(1000)
-      useRedisClock(t, redis)
-      const entered = Promise.withResolvers<void>()
-      let calls = 0
-      const events: SwrEvent[] = []
-      const cache = createSwrClient({
-        redis,
-        mode: 'swr-serverless',
-        onEvent: (event) => events.push(event),
-      }).cache({
-        key: 'inline-abort',
-        ttl: 1,
-        fetch: async (_ctx, { signal }) => {
-          if (++calls === 1 && phase === 'stale') return 'stale'
-          entered.resolve()
-          await new Promise<void>((_resolve, reject) => {
-            signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
-          })
-          return 'unexpected'
-        },
+    `AbortSignal: a pre-aborted get rejects with the original reason before Redis I/O, with ${memory} memory`,
+    { timeout: 5000 },
+    async () => {
+      const redis = createFakeRedis()
+      const cache = createSwrClient({ redis, memory: true }).cache({
+        key: 'pre-abort',
+        fetch: async () => 'cached',
       })
-      if (phase === 'stale') {
-        await cache.get()
-        redis.advanceTime(1500)
+      if (memory === 'warm') assert.equal(await cache.get(), 'cached')
+      let reads = 0
+      let scripts = 0
+      redis.getBuffer = async () => {
+        reads++
+        return null
       }
-      const controller = new AbortController()
-      const reason = new Error('caller cancelled')
-      const pending = cache.get(undefined, { signal: controller.signal })
-      await entered.promise
-      controller.abort(reason)
-      await assert.rejects(pending, (error) => error === reason)
-      assert.equal(await redis.get(toLockKey('inline-abort')), null)
-      assert.equal(
-        events.some((event) => event.type === 'error'),
-        false,
+      redis.eval = async () => {
+        scripts++
+        return null
+      }
+      const reason = new Error('already aborted')
+      await assert.rejects(
+        cache.get(undefined, { signal: AbortSignal.abort(reason) }),
+        (error) => error === reason,
       )
+      assert.equal(reads, 0)
+      assert.equal(scripts, 0)
     },
   )
+}
 
+// The refresh reports its own outcome once, whether or not its caller is still attached.
+const DETACHED_EVENTS = {
+  cold: { resolves: ['miss', 'refresh'], rejects: ['miss', 'fetch_cold_failure:error'] },
+  stale: { resolves: ['hit', 'refresh'], rejects: ['hit', 'stale_fallback:warn'] },
+}
+
+for (const phase of ['cold', 'stale'] as const) {
+  for (const outcome of ['resolves', 'rejects'] as const) {
+    test(
+      `AbortSignal: a caller leaving a ${phase} inline refresh rejects without aborting it, and the refresh ${outcome === 'resolves' ? 'still commits' : 'still cools down'}`,
+      { timeout: 2000 },
+      async (t) => {
+        const redis = createFakeRedis(1000)
+        useRedisClock(t, redis)
+        const entered = Promise.withResolvers<AbortSignal>()
+        const release = Promise.withResolvers<void>()
+        const failure = new Error('source failed')
+        let fetches = 0
+        const events: SwrEvent[] = []
+        const swr = createSwrClient({
+          redis,
+          runtime: 'serverless',
+          onEvent: (event) => events.push(event),
+        })
+        const cache = swr.cache({
+          key: 'inline-abort',
+          ttl: 1,
+          fetch: async (_ctx, { signal }) => {
+            if (++fetches === 1 && phase === 'stale') return 'stale'
+            entered.resolve(signal)
+            await release.promise
+            if (outcome === 'rejects') throw failure
+            return 'fresh'
+          },
+        })
+        if (phase === 'stale') {
+          await cache.get()
+          redis.advanceTime(1500)
+          events.length = 0
+        }
+        const controller = new AbortController()
+        const reason = new Error('caller cancelled')
+        const pending = cache.get(undefined, { signal: controller.signal })
+        const fetchSignal = await entered.promise
+        controller.abort(reason)
+        await assert.rejects(pending, (error) => error === reason)
+        assert.equal(fetchSignal.aborted, false)
+        const lock = await redis.get(toLockKey('inline-abort'))
+        assert.ok(lock && lock !== COOLDOWN_MARKER, 'the refresh still holds the lock')
+
+        release.resolve()
+        await swr.flush()
+        assert.deepEqual(
+          events.map((e) => (e.type === 'error' ? `${e.reason}:${e.severity}` : e.type)),
+          DETACHED_EVENTS[phase][outcome],
+        )
+        assert.equal(
+          await redis.get(toLockKey('inline-abort')),
+          outcome === 'resolves' ? null : COOLDOWN_MARKER,
+        )
+        if (outcome === 'resolves') assert.equal(await cache.get(), 'fresh')
+        assert.equal(fetches, phase === 'stale' ? 2 : 1)
+      },
+    )
+  }
+}
+
+for (const phase of ['cold', 'stale'] as const) {
   test(
     `AbortSignal: cancels ${phase} polling without fetching or deleting another owner lock`,
     { timeout: 2000 },
@@ -481,8 +550,8 @@ for (const phase of ['cold', 'stale'] as const) {
       const events: SwrEvent[] = []
       const cache = createSwrClient({
         redis,
-        mode: 'wait-on-stale',
-        pollIntervalMs: 1,
+        staleWait: 10,
+        pollInterval: 0.001,
         onEvent: (event) => {
           events.push(event)
           if (
@@ -517,95 +586,79 @@ for (const phase of ['cold', 'stale'] as const) {
   )
 }
 
-for (const phase of ['cold', 'stale'] as const) {
-  for (const mgetOutcome of ['hit', 'unlocked', 'redis_error'] as const) {
-    test(
-      `AbortSignal: abort during in-flight ${phase} poll MGET (${mgetOutcome}) cancels without hit, fallback, or steal`,
-      { timeout: 2000 },
-      async (t) => {
-        const redis = createFakeRedis(1000)
-        useRedisClock(t, redis)
-        let decodes = 0
-        const codec: SwrCodec<string> = {
-          encode: (value) => Buffer.from(value),
-          decode: (bytes) => {
-            decodes++
-            return Buffer.from(bytes).toString()
-          },
-        }
-        const key = `abort-mget:${phase}:${mgetOutcome}`
-        const cache = createSwrClient({
-          redis,
-          memory: true,
-          mode: 'wait-on-stale',
-          failureStrategy: 'availability',
-          pollIntervalMs: 1,
-        }).cache<string>({
-          key,
-          ttl: 5,
-          codec,
-          fetch: async () => assert.fail('aborted waiter must not fetch'),
-        })
+// A successful MGET and a failed one hit separate abort checks; each case would otherwise
+// steal the lock, serve a hit, or serve stale data.
+for (const [phase, mgetOutcome] of [
+  ['cold', 'unlocked'],
+  ['stale', 'hit'],
+  ['stale', 'redis_error'],
+] as const) {
+  test(
+    `AbortSignal: abort during an in-flight ${phase} poll MGET (${mgetOutcome}) awaits the reply, then rejects without acting on it`,
+    { timeout: 2000 },
+    async (t) => {
+      const redis = createFakeRedis(1000)
+      useRedisClock(t, redis)
+      const key = `abort-mget:${phase}:${mgetOutcome}`
+      const events: SwrEvent[] = []
+      const cache = createSwrClient({
+        redis,
+        staleWait: 10,
+        pollInterval: 0.001,
+        onEvent: (event) => events.push(event),
+      }).cache<string>({
+        key,
+        ttl: 5,
+        fetch: async () => assert.fail('aborted waiter must not fetch'),
+      })
 
-        if (phase === 'stale') {
-          await redis.set(
-            toDataKey(key),
-            encodeEnvelope(
-              { value: 'stale', cachedAtMs: 0, freshUntilMs: 500, expiresAtMs: 10_000 },
-              codec,
-            ),
-          )
-        }
-        await redis.set(toLockKey(key), 'other-owner', 'PX', 5000)
-
-        const freshBuf = encodeEnvelope(
-          { value: 'fresh', cachedAtMs: 1000, freshUntilMs: 6000, expiresAtMs: 20_000 },
-          codec,
+      if (phase === 'stale') {
+        await redis.set(
+          toDataKey(key),
+          encodeEnvelope({ value: 'stale', cachedAtMs: 0, freshUntilMs: 500, expiresAtMs: 10_000 }),
         )
-        let acquireCalls = 0
-        interceptAcquire(redis, (acquire, ...args) => {
-          acquireCalls++
-          return acquire(...args)
-        })
+      }
+      await redis.set(toLockKey(key), 'other-owner', 'PX', 5000)
+      let acquireCalls = 0
+      interceptAcquire(redis, (acquire, ...args) => {
+        acquireCalls++
+        return acquire(...args)
+      })
 
-        const gatedMget = gateCommand(async () => {
-          if (mgetOutcome === 'redis_error') throw new Error('mget failed')
-          if (mgetOutcome === 'hit') return [freshBuf, null]
-          return [null, null]
-        }, 'before execution')
-        redis.mgetBuffer = gatedMget.command as typeof redis.mgetBuffer
+      const fresh = encodeEnvelope({
+        value: 'fresh',
+        cachedAtMs: 1000,
+        freshUntilMs: 6000,
+        expiresAtMs: 20_000,
+      })
+      const gatedMget = gateCommand(async () => {
+        if (mgetOutcome === 'redis_error') throw new Error('mget failed')
+        return mgetOutcome === 'hit' ? [fresh, null] : [null, null]
+      }, 'before execution')
+      redis.mgetBuffer = gatedMget.command as typeof redis.mgetBuffer
 
-        const controller = new AbortController()
-        const reason = new Error(`cancelled-${phase}-${mgetOutcome}`)
-        const pending = cache.get(undefined, { signal: controller.signal })
-        await gatedMget.entered
+      const controller = new AbortController()
+      const reason = new Error(`cancelled-${phase}-${mgetOutcome}`)
+      const pending = cache.get(undefined, { signal: controller.signal })
+      await gatedMget.entered
+      controller.abort(reason)
+      let settled = false
+      void pending.catch(() => (settled = true))
+      await setImmediate()
+      assert.equal(settled, false, 'the in-flight reply is awaited')
+      gatedMget.release()
 
-        const decodesBeforeAbort = decodes
-        controller.abort(reason)
-        gatedMget.release()
-
-        await assert.rejects(pending, (err) => err === reason)
-        assert.equal(acquireCalls, 1, 'aborted waiter must not attempt lock steal')
-        assert.equal(decodes, decodesBeforeAbort, 'aborted MGET must skip payload decode')
-
-        if (mgetOutcome === 'hit') {
-          // The aborted hit must not have populated memory: the next read goes to Redis.
-          await redis.set(toDataKey(key), freshBuf)
-          let reads = 0
-          const getBuffer = redis.getBuffer.bind(redis)
-          redis.getBuffer = async (k) => {
-            reads++
-            return getBuffer(k)
-          }
-          assert.equal(await cache.get(), 'fresh')
-          assert.equal(reads, 1)
-        }
-      },
-    )
-  }
+      await assert.rejects(pending, (err) => err === reason)
+      assert.equal(acquireCalls, 1, 'only the initial acquire ran')
+      assert.deepEqual(
+        events.map((event) => (event.type === 'poll' ? `poll:${event.outcome}` : event.type)),
+        [phase === 'cold' ? 'miss' : 'hit', 'poll:cancelled'],
+      )
+    },
+  )
 }
 
-for (const acquireOutcome of ['acquired', 'contended', 'redis_error', 'lost_reply'] as const) {
+for (const acquireOutcome of ['acquired', 'contended', 'lost_reply'] as const) {
   test(
     `AbortSignal: abort during in-flight cold lock reacquisition (${acquireOutcome}) cancels cleanly`,
     { timeout: 2000 },
@@ -616,7 +669,7 @@ for (const acquireOutcome of ['acquired', 'contended', 'redis_error', 'lost_repl
       const cache = createSwrClient({
         redis,
         failureStrategy: 'availability',
-        pollIntervalMs: 1,
+        pollInterval: 0.001,
       }).cache<string>({
         key,
         ttl: 5,
@@ -637,10 +690,9 @@ for (const acquireOutcome of ['acquired', 'contended', 'redis_error', 'lost_repl
       })
       const gatedSteal = gateCommand(
         async (acquire: Acquire, lockKey: string, token: string, ttlMs: number) => {
-          if (acquireOutcome === 'redis_error') throw new Error('acquire failed')
           if (acquireOutcome === 'contended') {
             await redis.set(lockKey, 'other-owner', 'PX', 5000)
-            return false
+            return 'busy'
           }
           const acquired = await acquire(lockKey, token, ttlMs)
           if (acquireOutcome === 'lost_reply') throw new Error('reply lost after acquisition')
@@ -669,49 +721,36 @@ for (const acquireOutcome of ['acquired', 'contended', 'redis_error', 'lost_repl
 
 for (const readOutcome of ['fresh', 'redis_error'] as const) {
   test(
-    `AbortSignal: abort during initial getBuffer (${readOutcome}) skips decode, lock, events, and memory`,
+    `AbortSignal: abort during the initial getBuffer (${readOutcome}) awaits the reply, then rejects without locking, fetching, or events`,
     { timeout: 2000 },
     async (t) => {
       const redis = createFakeRedis(1000)
       useRedisClock(t, redis)
-      let decodes = 0
-      const codec: SwrCodec<string> = {
-        encode: (value) => Buffer.from(value),
-        decode: (bytes) => {
-          decodes++
-          return Buffer.from(bytes).toString()
-        },
-      }
       const key = `abort-read:${readOutcome}`
       const events: SwrEvent[] = []
-      const cache = createSwrClient({
-        redis,
-        memory: true,
-        onEvent: (e) => events.push(e),
-      }).cache<string>({
+      const cache = createSwrClient({ redis, onEvent: (e) => events.push(e) }).cache<string>({
         key,
         ttl: 5,
-        codec,
         fetch: async () => assert.fail('aborted initial read must not fetch'),
       })
       await redis.set(
         toDataKey(key),
-        encodeEnvelope(
-          { value: 'fresh', cachedAtMs: 1000, freshUntilMs: 6000, expiresAtMs: 20_000 },
-          codec,
-        ),
+        encodeEnvelope({
+          value: 'fresh',
+          cachedAtMs: 1000,
+          freshUntilMs: 6000,
+          expiresAtMs: 20_000,
+        }),
       )
-
       let acquireCalls = 0
       interceptAcquire(redis, (acquire, ...args) => {
         acquireCalls++
         return acquire(...args)
       })
-
-      const origGetBuffer = redis.getBuffer.bind(redis)
+      const getBuffer = redis.getBuffer.bind(redis)
       const gatedRead = gateCommand(async (k: string) => {
         if (readOutcome === 'redis_error') throw new Error('getBuffer failed')
-        return origGetBuffer(k)
+        return getBuffer(k)
       }, 'before execution')
       redis.getBuffer = gatedRead.command as typeof redis.getBuffer
 
@@ -719,31 +758,23 @@ for (const readOutcome of ['fresh', 'redis_error'] as const) {
       const reason = new Error(`cancelled-read-${readOutcome}`)
       const pending = cache.get(undefined, { signal: controller.signal })
       await gatedRead.entered
-
       controller.abort(reason)
+      let settled = false
+      void pending.catch(() => (settled = true))
+      await setImmediate()
+      assert.equal(settled, false, 'the in-flight reply is awaited')
       gatedRead.release()
 
       await assert.rejects(pending, (err) => err === reason)
-      assert.equal(decodes, 0)
       assert.equal(acquireCalls, 0)
       assert.deepEqual(events, [])
-
-      if (readOutcome === 'fresh') {
-        let reads = 0
-        redis.getBuffer = async (k) => {
-          reads++
-          return origGetBuffer(k)
-        }
-        assert.equal(await cache.get(), 'fresh')
-        assert.equal(reads, 1, 'aborted fresh read must not populate memory')
-      }
     },
   )
 }
 
 // Both outcomes leave our token in Redis, so a leaked lock shows up as a non-null lock key.
 for (const [phase, acquireOutcome] of [
-  ['cold', 'replayed_acquire'],
+  ['cold', 'acquired'],
   ['stale', 'lost_reply'],
 ] as const) {
   test(
@@ -758,7 +789,6 @@ for (const [phase, acquireOutcome] of [
       let fetches = 0
       const cache = createSwrClient({
         redis,
-        mode: 'swr',
         onEvent: (e) => events.push(e),
         waitUntil: () => {
           waitUntilCalls++
@@ -779,9 +809,9 @@ for (const [phase, acquireOutcome] of [
 
       const gatedAcquire = gateCommand(
         async (acquire: Acquire, lockKey: string, token: string, ttlMs: number) => {
-          await acquire(lockKey, token, ttlMs)
+          const acquired = await acquire(lockKey, token, ttlMs)
           if (acquireOutcome === 'lost_reply') throw new Error('reply lost after acquire')
-          return acquire(lockKey, token, ttlMs)
+          return acquired
         },
         'before execution',
       )
@@ -795,6 +825,10 @@ for (const [phase, acquireOutcome] of [
       await gatedAcquire.entered
 
       controller.abort(reason)
+      let settled = false
+      void pending.catch(() => (settled = true))
+      await setImmediate()
+      assert.equal(settled, false, 'the in-flight reply is awaited')
       gatedAcquire.release()
 
       await assert.rejects(pending, (err) => err === reason)
@@ -853,41 +887,48 @@ test(
   },
 )
 
-test(
-  'A lost acquire reply starts cleanup without delaying the fallback fetch',
-  { timeout: 2000 },
-  async () => {
-    const redis = createFakeRedis()
-    const commands = registerLockCommands(redis)
-    const release = gateCommand(commands.swrReleaseLock.bind(redis), 'before execution')
-    const released = Promise.withResolvers<void>()
-    commands.swrReleaseLock = async (...args) => {
-      const result = await release.command(...args)
-      released.resolve()
-      return result
-    }
+for (const failureStrategy of ['availability', 'protect-source'] as const) {
+  test(
+    `A lost acquire reply under ${failureStrategy} settles the caller at once while flush and waitUntil wait for the release`,
+    { timeout: 2000 },
+    async () => {
+      const redis = createFakeRedis()
+      const commands = registerLockCommands(redis)
+      const release = gateCommand(commands.swrReleaseLock.bind(redis), 'before execution')
+      commands.swrReleaseLock = release.command
+      interceptAcquire(redis, async (acquire, ...args) => {
+        await acquire(...args)
+        throw new Error('reply lost after lock grant')
+      })
+      const tracked: Promise<unknown>[] = []
+      const swr = createSwrClient({
+        redis,
+        failureStrategy,
+        waitUntil: (promise) => tracked.push(promise),
+      })
+      const cache = swr.cache({
+        key: 'lost-grant',
+        fetch: async (_context, { cacheWrite }) => cacheWrite,
+      })
 
-    interceptAcquire(redis, async (acquire, ...args) => {
-      await acquire(...args)
-      throw new Error('reply lost after lock grant')
-    })
-    const cache = createSwrClient({ redis }).cache({
-      key: 'lost-grant',
-      fetch: async (_context, { cacheWrite }) => cacheWrite,
-    })
-
-    const pending = cache.get()
-    await release.entered
-    try {
-      assert.equal(await pending, 'skip')
+      const pending = cache.get()
+      await release.entered
+      if (failureStrategy === 'availability') assert.equal(await pending, 'skip')
+      else await assert.rejects(pending, SwrRedisError)
       assert.ok(await redis.get(toLockKey('lost-grant')))
-    } finally {
+      assert.equal(tracked.length, 1)
+
+      let flushed = false
+      const flushing = swr.flush().then(() => (flushed = true))
+      await setImmediate()
+      assert.equal(flushed, false, 'flush waits for the pending release')
       release.release()
-      await released.promise
-    }
-    assert.equal(await redis.get(toLockKey('lost-grant')), null)
-  },
-)
+      await flushing
+      await tracked[0]
+      assert.equal(await redis.get(toLockKey('lost-grant')), null)
+    },
+  )
+}
 
 test(
   'AbortSignal: an onEvent abort after lock acquisition skips the fetch and releases the lock',
@@ -931,3 +972,272 @@ test(
     )
   },
 )
+
+for (const phase of ['cold', 'stale'] as const) {
+  test(`fetchTimeout: a hung ${phase} fetch is aborted, the key cools down, and the late result is discarded`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+    const events: SwrEvent[] = []
+    const entered = Promise.withResolvers<AbortSignal>()
+    const late = Promise.withResolvers<string>()
+    let fetches = 0
+    const { redis, memory, cache } = memoryHarness<string>(
+      t,
+      {
+        key: 'hung',
+        fetch: async (_ctx, { signal }) => {
+          fetches++
+          entered.resolve(signal)
+          return late.promise
+        },
+      },
+      { runtime: 'serverless', fetchTimeout: 5, onEvent: (event) => events.push(event) },
+    )
+    const staleTiming = { cachedAtMs: 0, freshUntilMs: 500, expiresAtMs: 60_000 }
+    if (phase === 'stale') {
+      await redis.set(toDataKey('hung'), encodeEnvelope({ value: 'stale', ...staleTiming }))
+    }
+    const before = await redis.getBuffer(toDataKey('hung'))
+
+    const pending = cache.getWithMeta()
+    const settled =
+      phase === 'cold'
+        ? assert.rejects(
+            pending,
+            (err) => err instanceof SwrTimeoutError && err.phase === 'fetch' && err.key === 'hung',
+          )
+        : pending.then((result) =>
+            assert.deepEqual(result, { value: 'stale', source: 'redis', timing: staleTiming }),
+          )
+    const signal = await entered.promise
+    // Step through renewals so the lease outlives the default 3s lockTtl.
+    for (let elapsed = 0; elapsed < 5000; elapsed += 1000) await tick(t, redis, 1000)
+    await settled
+    assert.ok(signal.aborted && signal.reason instanceof SwrTimeoutError)
+
+    late.resolve('late')
+    await setImmediate()
+    assert.equal(fetches, 1)
+    assert.deepEqual(await redis.getBuffer(toDataKey('hung')), before)
+    assert.equal(await redis.get(toLockKey('hung')), COOLDOWN_MARKER)
+    assert.equal(memory.entryCount, 0)
+    // Serving stale data downgrades the timeout to a warning.
+    assert.deepEqual(
+      events.flatMap((e) => (e.type === 'error' ? [`${e.reason}:${e.severity}`] : [])),
+      [`timeout:${phase === 'cold' ? 'error' : 'warn'}`],
+    )
+  })
+}
+
+test('failureCooldown: the marker expires failureCooldown after the failure, not after the fetch start', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  const failure = new Error('slow failure')
+  const cache = createSwrClient({ redis, failureCooldown: 1 }).cache({
+    key: 'slow-fail',
+    fetch: async () => {
+      redis.advanceTime(1500)
+      throw failure
+    },
+  })
+  await assert.rejects(cache.get(), (err) => err === failure)
+  assert.equal(await redis.get(toLockKey('slow-fail')), COOLDOWN_MARKER)
+  assert.equal(await redis.pttl(toLockKey('slow-fail')), 1000)
+})
+
+test('failureCooldown 0: a failed fetch releases the lock, so the next caller fetches at once', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  const failure = new Error('transient')
+  let fetches = 0
+  const cache = createSwrClient({ redis, failureCooldown: 0 }).cache({
+    key: 'no-cooldown',
+    fetch: async () => {
+      if (++fetches === 1) throw failure
+      return 'recovered'
+    },
+  })
+  await assert.rejects(cache.get(), (err) => err === failure)
+  assert.equal(await redis.get(toLockKey('no-cooldown')), null)
+  assert.equal(await cache.get(), 'recovered')
+  assert.equal(fetches, 2)
+})
+
+for (const write of ['set', 'invalidate'] as const) {
+  test(`Cooldown: ${write}() clears an active marker`, async (t) => {
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    let fetches = 0
+    const cache = createSwrClient({ redis }).cache({
+      key: 'cleared',
+      fetch: async () => {
+        if (++fetches === 1) throw new Error('broken source')
+        return 'fixed'
+      },
+    })
+    await assert.rejects(cache.get())
+    assert.equal(await redis.get(toLockKey('cleared')), COOLDOWN_MARKER)
+    if (write === 'set') await cache.set(undefined, 'explicit')
+    else await cache.invalidate()
+    assert.equal(await redis.get(toLockKey('cleared')), null)
+    assert.equal(await cache.get(), write === 'set' ? 'explicit' : 'fixed')
+    assert.equal(fetches, write === 'set' ? 1 : 2)
+  })
+
+  test(`Cooldown swap racing ${write}(): the write clears the lock first, so no marker is written`, async (t) => {
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    const commands = registerLockCommands(redis)
+    const swap = gateCommand(commands.swrCooldownLock.bind(redis), 'before execution')
+    let swapReply: Promise<unknown> | undefined
+    commands.swrCooldownLock = (...args) => (swapReply = swap.command(...args))
+    const failure = new Error('broken source')
+    const events: SwrEvent[] = []
+    let fetches = 0
+    const cache = createSwrClient({ redis, onEvent: (event) => events.push(event) }).cache({
+      key: 'swap-race',
+      fetch: async () => {
+        if (++fetches === 1) throw failure
+        return 'fixed'
+      },
+    })
+
+    const pending = cache.get()
+    await swap.entered
+    if (write === 'set') await cache.set(undefined, 'explicit')
+    else await cache.invalidate()
+    swap.release()
+    await assert.rejects(pending, (err) => err === failure)
+    assert.equal(await swapReply, '0')
+    assert.equal(await redis.get(toLockKey('swap-race')), null)
+    assert.deepEqual(
+      events.flatMap((e) => (e.type === 'error' ? [e.reason] : [])),
+      ['fetch_cold_failure'],
+    )
+    assert.equal(await cache.get(), write === 'set' ? 'explicit' : 'fixed')
+    assert.equal(fetches, write === 'set' ? 1 : 2)
+  })
+}
+
+for (const outcome of ['resolves', 'rejects', 'times out'] as const) {
+  test(`Direct fallback: concurrent callers share one fetch per key and cache instance, which ${outcome} once for all of them`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const redis = createFakeRedis(1000)
+    useRedisClock(t, redis)
+    redis.getBuffer = async () => {
+      throw new Error('Redis down')
+    }
+    const release = Promise.withResolvers<void>()
+    const events: SwrEvent[] = []
+    const calls: string[] = []
+    const swr = createSwrClient({ redis, fetchTimeout: 5, onEvent: (event) => events.push(event) })
+    const fetchFor = (instance: string) => async (id: string) => {
+      calls.push(`${instance}:${id}`)
+      await release.promise
+      if (outcome === 'rejects') throw new Error(`source failed for ${id}`)
+      return { id }
+    }
+    const cache = swr.cache({ key: (id: string) => id, fetch: fetchFor('cache') })
+    const otherInstance = swr.cache({ key: (id: string) => id, fetch: fetchFor('other') })
+
+    const results = Promise.allSettled([
+      cache.get('A'),
+      cache.get('A'),
+      cache.get('B'),
+      otherInstance.get('A'),
+    ])
+    await setImmediate()
+    assert.deepEqual(calls.sort(), ['cache:A', 'cache:B', 'other:A'])
+    if (outcome === 'times out') await tick(t, redis, 5000)
+    else release.resolve()
+
+    const settled = await results
+    assert.deepEqual(
+      settled.map((result) => result.status),
+      Array(4).fill(outcome === 'resolves' ? 'fulfilled' : 'rejected'),
+    )
+    const [a1, a2, b, otherA] = settled.map((result) =>
+      result.status === 'fulfilled' ? result.value : result.reason,
+    )
+    if (outcome === 'resolves') {
+      assert.deepEqual([a1, b, otherA], [{ id: 'A' }, { id: 'B' }, { id: 'A' }])
+    } else if (outcome === 'rejects') {
+      assert.deepEqual(
+        [a1.message, b.message, otherA.message],
+        ['source failed for A', 'source failed for B', 'source failed for A'],
+      )
+    } else {
+      for (const [err, key] of [
+        [a1, 'A'],
+        [b, 'B'],
+        [otherA, 'A'],
+      ]) {
+        assert.ok(err instanceof SwrTimeoutError && err.phase === 'fetch' && err.key === key)
+      }
+    }
+    assert.equal(a2, a1, 'callers of one key share the same result')
+    assert.notEqual(otherA, a1, 'cache instances never share a fetch')
+    const failureEvent = {
+      resolves: [],
+      rejects: ['fetch_cold_failure:error'],
+      'times out': ['timeout:error'],
+    }
+    assert.deepEqual(
+      events.flatMap((e) =>
+        e.type === 'error' && e.reason !== 'redis_error_fallback'
+          ? [`${e.reason}:${e.severity}`]
+          : [],
+      ),
+      Array(3).fill(failureEvent[outcome]).flat(),
+      'one failure event per fetch, not per caller',
+    )
+  })
+}
+
+test('Direct fallback: the last caller leaving aborts the fetch, and its late failure is not reported and leaves the replacement shared', async (t) => {
+  const redis = createFakeRedis(1000)
+  useRedisClock(t, redis)
+  redis.getBuffer = async () => {
+    throw new Error('Redis down')
+  }
+  const events: SwrEvent[] = []
+  const signals: AbortSignal[] = []
+  const results: PromiseWithResolvers<string>[] = []
+  const cache = createSwrClient({ redis, onEvent: (event) => events.push(event) }).cache({
+    key: 'direct-leave',
+    // Ignores its signal, so the aborted fetch settles after its replacement starts.
+    fetch: async (_ctx, { signal }) => {
+      signals.push(signal)
+      const result = Promise.withResolvers<string>()
+      results.push(result)
+      return result.promise
+    },
+  })
+
+  const a = new AbortController()
+  const b = new AbortController()
+  const first = cache.get(undefined, { signal: a.signal })
+  const second = cache.get(undefined, { signal: b.signal })
+  await setImmediate()
+  assert.equal(signals.length, 1)
+  a.abort(new Error('a left'))
+  await assert.rejects(first, { message: 'a left' })
+  assert.equal(signals[0]!.aborted, false, 'b is still attached')
+  b.abort(new Error('b left'))
+  await assert.rejects(second, { message: 'b left' })
+  assert.equal(signals[0]!.aborted, true)
+
+  const replacement = cache.get()
+  await setImmediate()
+  assert.equal(signals.length, 2)
+  results[0]!.reject(new Error('abandoned fetch failed late'))
+  await setImmediate()
+  const joined = cache.get()
+  await setImmediate()
+  assert.equal(signals.length, 2, 'a late settle does not remove the replacement')
+  results[1]!.resolve('replacement')
+  assert.deepEqual(await Promise.all([replacement, joined]), ['replacement', 'replacement'])
+  assert.deepEqual(
+    events.flatMap((e) => (e.type === 'error' && e.reason !== 'redis_error_fallback' ? [e] : [])),
+    [],
+  )
+})

@@ -10,7 +10,7 @@ them. Examples build on `redis`, `swr`, and `userCache` from
 
 ## Options
 
-Durations are in seconds, except `pollIntervalMs`, which is in milliseconds.
+Durations are in seconds.
 
 | Option | Set on | Description |
 | --- | --- | --- |
@@ -20,20 +20,21 @@ Durations are in seconds, except `pollIntervalMs`, which is in milliseconds.
 | `fetch` | Cache | Required. `(context, meta) => Promise<value>`. See [fetch results](/swr-redis/fetch-results/). |
 | `ttl` | Client, cache | Fresh lifetime in seconds. A cache can pass a callback. Default: `120`. |
 | `staleMultiplier` | Client, cache | Total Redis lifetime is `ttl * staleMultiplier`. Set `1` to disable the stale window. Default: `5`. |
-| `mode` | Client, cache | Stale revalidation mode: `'swr'`, `'swr-serverless'`, or `'wait-on-stale'`. Default: `'swr'`. |
-| `failureStrategy` | Client, cache | Behavior on Redis errors or wait timeouts when no stale value is available: `'availability'` or `'protect-source'`. Default: `'availability'`. |
+| `staleWait` | Client, cache, `get()` | Seconds a caller holding stale data waits for fresh data (`0` returns stale immediately, `Infinity` waits until settled). Default: `0`. |
+| `runtime` | Client | What happens without a `waitUntil` hook: `'server'` (background work allowed) or `'serverless'` (lock winner waits inline). Default: `'server'`. |
+| `fetchTimeout` | Client, cache | Seconds a single `fetch` call may run; also bounds how long waiters poll. Default: `30`. |
+| `failureCooldown` | Client, cache | Seconds a key rests after a fetch fails or times out (`0` disables). Default: `1`. |
+| `failureStrategy` | Client, cache | Behavior on Redis errors when no stale value is available: `'availability'` or `'protect-source'`. Default: `'availability'`. |
 | `memory` | Client, cache, `get()` | Process-local LRU cache. Enable on the client with `true` or `{ maxEntries, maxTtl, clone }`; pass `false` on a cache or `get()` to opt out. Default: `false`. |
-| `signal` | `get()` | Cancels waiting and is forwarded to inline `fetch` calls. |
+| `signal` | `get()` | Cancels this call (checked between steps) without aborting a leased refresh (a direct fallback fetch under `'availability'` aborts once its last caller leaves). Pass `AbortSignal.timeout(ms)` for a request deadline. |
 | `name` | Cache | Low-cardinality label reported as `event.cache`. |
 | `codec` | Client, cache | Serializer: `{ encode, decode }`. Default: BSON. |
 | `compression` | Client, cache | zlib settings: `true`, `false`, or `{ level, minBytes }`. Default: `{ level: 1, minBytes: 256 }`. |
-| `lockTtl` | Client, cache | Initial fetch lock TTL, renewed automatically while `fetch` runs. Default: `3`. |
-| `maxLockTtl` | Client, cache | Maximum duration a single fetch keeps renewing its lock. Default: `max(30, lockTtl)`. |
-| `waitTimeout` | Client, cache | Time budget for polling while another caller holds the lock. Default: `10`. |
-| `pollIntervalMs` | Client, cache | Base interval between poll checks while waiting. Default: `80`. |
-| `isFatal` | Client, cache | Predicate marking fetch errors that should throw instead of falling back to a stale value. |
+| `lockTtl` | Client, cache | Fetch lock TTL, renewed while `fetch` runs; controls crash detection. Default: `3`. |
+| `pollInterval` | Client, cache | Base interval between poll checks while waiting, plus up to 30% jitter. Default: `0.08`. |
+| `isFatal` | Client, cache | Predicate marking fetch errors that should throw to a waiting caller instead of falling back to stale data. |
 | `onEvent` | Client | Telemetry callback. See [observability](/swr-redis/observability/). |
-| `waitUntil` | Client, `get()` | Serverless lifecycle hook for background `'swr'` refreshes. A per-call hook overrides the client hook. |
+| `waitUntil` | Client, `get()` | Keep-alive hook for refresh promises; enables background work under either `runtime`. A per-call hook overrides the client hook. |
 
 ## Set the TTL from the fetched value
 
@@ -95,13 +96,19 @@ const userFromRedis = await userCache.get('u_123', { memory: false })
 
 ## Advanced
 
-### Lock and polling tuning
+### Timing, cooldowns, and polling
 
-For slow fetches, increase `maxLockTtl` to allow lock renewal for longer.
-Increase `waitTimeout` if callers should wait longer for a shared result.
-A longer `pollIntervalMs` reduces Redis reads and can delay when waiting
-callers see the result. The final poll can finish after the budget expires and
-return a cached value or take over an available lock on a cold miss.
+`fetchTimeout` bounds each source call (including background refreshes) and also
+caps how long waiters poll behind it. Set it above how long your source normally
+takes, because late results are discarded and trigger a cooldown.
+
+`failureCooldown` spaces out retries after a fetch fails or times out (about one
+attempt per key per cooldown across all processes). Increase it for expensive
+sources, or set `0` to disable it.
+
+`lockTtl` controls how quickly a crashed fetcher's lock expires (locks renew
+automatically until `fetch` settles or `fetchTimeout` fires). A longer
+`pollInterval` reduces Redis reads at the cost of extra wait latency.
 
 ### Serialization and compression
 
@@ -143,14 +150,16 @@ to tune it (`level` `0`–`9`).
 Compression settings can be changed safely without invalidating existing keys.
 Changing a `codec` cannot decode old entries, so bump a version segment in your
 key. Decode and decompression errors throw under both failure strategies without
-triggering a new fetch, unless a waiting `'wait-on-stale'` caller can fall back
-to an unexpired stale value (reported via a `stale_fallback` event).
+triggering a new fetch, unless a caller holding an unexpired stale value can
+fall back to it (reported via a `stale_fallback` event).
 
 ### Set ioredis command timeouts
 
-Configure `commandTimeout` (in milliseconds) on your `ioredis` connection. A
-timed-out command is treated as a
-[Redis failure](/swr-redis/consistency/#failure-strategies).
+Configure `commandTimeout` (in milliseconds) and `maxRetriesPerRequest` on your
+`ioredis` connection. Caller `signal` cancellation is checked between Redis
+commands rather than interrupting commands in flight, so these settings bound
+how long a stalled Redis command can block a call. A timed-out command is
+treated as a [Redis failure](/swr-redis/consistency/#failure-strategies).
 
 For caches with large payloads, duplicate the connection with a longer timeout
 and create a second client sharing the same `prefix`:

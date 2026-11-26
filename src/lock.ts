@@ -1,13 +1,22 @@
 import { randomUUID } from 'node:crypto'
 import type { Redis } from 'ioredis'
 
+// Held in the lock key after a failed fetch. Owner tokens are UUIDs, so it can't collide.
+export const COOLDOWN_MARKER = 'CD'
+const COOLDOWN_MARKER_BUFFER = Buffer.from(COOLDOWN_MARKER)
+
+export type AcquireOutcome = 'acquired' | 'busy' | 'cooldown'
+
 export const ACQUIRE_LOCK_SCRIPT = `
 local owner = redis.call("GET", KEYS[1])
+if owner == "${COOLDOWN_MARKER}" then
+  return "cooldown"
+end
 if owner and owner ~= ARGV[1] then
-  return "0"
+  return "busy"
 end
 redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
-return "1"
+return "acquired"
 `
 
 export const EXTEND_LOCK_SCRIPT = `
@@ -21,12 +30,20 @@ end
 return tostring(redis.call("PEXPIRE", KEYS[1], ttl))
 `
 
+export const COOLDOWN_LOCK_SCRIPT = `
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return "0"
+end
+redis.call("SET", KEYS[1], "${COOLDOWN_MARKER}", "PX", ARGV[2])
+return "1"
+`
+
 export const COMMIT_AND_RELEASE_SCRIPT = `
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return "0"
 end
 for i = 2, #KEYS do
-  redis.call("SET", KEYS[i], ARGV[2 * i - 2], "EX", ARGV[2 * i - 1])
+  redis.call("SET", KEYS[i], ARGV[2 * i - 2], "PX", ARGV[2 * i - 1])
 end
 redis.call("UNLINK", KEYS[1])
 return "1"
@@ -40,21 +57,26 @@ return "0"
 `
 
 export const SET_AND_CLEAR_LOCK_SCRIPT = `
-redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
 redis.call("UNLINK", KEYS[2])
 return "1"
 `
 
+export function isCooldownMarker(value: Buffer) {
+  return value.equals(COOLDOWN_MARKER_BUFFER)
+}
+
 export interface RedisWriteEntry {
   readonly dataKey: string
   readonly buffer: Buffer
-  readonly ttlSeconds: number
+  readonly ttlMs: number
 }
 
 type LuaFlag = '0' | '1'
 
-export interface SwrRedisCommands {
-  swrAcquireLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<LuaFlag>
+interface SwrRedisCommands {
+  swrAcquireLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<AcquireOutcome>
+  swrCooldownLock: (lockKey: string, token: string, cooldownMs: number) => Promise<LuaFlag>
   swrExtendLock: (lockKey: string, token: string, lockTtlMs: number) => Promise<LuaFlag>
   swrCommitAndRelease: (
     numberOfKeys: number,
@@ -65,7 +87,7 @@ export interface SwrRedisCommands {
     dataKey: string,
     lockKey: string,
     buffer: Buffer,
-    ttlSeconds: number,
+    ttlMs: number,
   ) => Promise<LuaFlag>
 }
 
@@ -73,6 +95,7 @@ export type SwrRedis = Redis & SwrRedisCommands
 
 const LOCK_SCRIPTS = {
   swrAcquireLock: { numberOfKeys: 1, lua: ACQUIRE_LOCK_SCRIPT },
+  swrCooldownLock: { numberOfKeys: 1, lua: COOLDOWN_LOCK_SCRIPT },
   swrExtendLock: { numberOfKeys: 1, lua: EXTEND_LOCK_SCRIPT },
   swrCommitAndRelease: { lua: COMMIT_AND_RELEASE_SCRIPT },
   swrReleaseLock: { numberOfKeys: 1, lua: RELEASE_LOCK_SCRIPT },
@@ -101,40 +124,33 @@ export class RedisLock {
     this.key = key
   }
 
-  async acquire(ttlMs: number): Promise<boolean> {
-    return (await this.redis.swrAcquireLock(this.key, this.token, ttlMs)) === '1'
+  async acquire(ttlMs: number) {
+    return this.redis.swrAcquireLock(this.key, this.token, ttlMs)
   }
 
-  async hold<R>(
-    timing: { readonly lockTtlMs: number; readonly maxLockTtlMs: number },
-    onRenewError: (err: unknown) => void,
-    fn: () => Promise<R>,
-  ): Promise<R> {
-    const { lockTtlMs, maxLockTtlMs } = timing
-    if (maxLockTtlMs <= lockTtlMs) return await fn()
-
-    const startMs = Date.now()
-    // A renewal can still be in flight after `fn` settles.
-    let active = true
+  // Renews the full lockTtlMs until stop(); renewal errors retry on the next tick.
+  startRenewal(
+    lockTtlMs: number,
+    callbacks: { onRenewError(err: unknown): void; onLockLost(): void },
+  ) {
+    let state: 'active' | 'stopped' | 'lost' = 'active'
     let renewing = false
     const timer = setInterval(
       () => {
         if (renewing) return
-        const remainingMs = maxLockTtlMs - (Date.now() - startMs)
-        if (remainingMs <= 0) {
-          clearInterval(timer)
-          return
-        }
         renewing = true
-        const extendMs = Math.min(lockTtlMs, remainingMs)
-        void this.redis.swrExtendLock(this.key, this.token, extendMs).then(
+        void this.redis.swrExtendLock(this.key, this.token, lockTtlMs).then(
           (extended) => {
             renewing = false
-            if (extended !== '1' || remainingMs <= lockTtlMs) clearInterval(timer)
+            // A reply after stop() may follow this fetch's own commit or cooldown swap.
+            if (extended === '1' || state !== 'active') return
+            state = 'lost'
+            clearInterval(timer)
+            callbacks.onLockLost()
           },
           (err: unknown) => {
             renewing = false
-            if (active) onRenewError(err)
+            if (state === 'active') callbacks.onRenewError(err)
           },
         )
       },
@@ -143,23 +159,32 @@ export class RedisLock {
     )
     timer.unref()
 
-    try {
-      return await fn()
-    } finally {
-      active = false
-      clearInterval(timer)
+    return {
+      // True once a renewal sees the lock gone while the fetch is still active.
+      get lost() {
+        return state === 'lost'
+      },
+      stop() {
+        if (state === 'active') state = 'stopped'
+        clearInterval(timer)
+      },
     }
   }
 
-  async commit(entries: readonly RedisWriteEntry[]): Promise<boolean> {
+  // Swaps this owner's token for the cooldown marker; returns false if the lock is gone.
+  async cooldown(cooldownMs: number) {
+    return (await this.redis.swrCooldownLock(this.key, this.token, cooldownMs)) === '1'
+  }
+
+  async commit(entries: readonly RedisWriteEntry[]) {
     const args: (string | Buffer | number)[] = [this.key]
     for (const entry of entries) args.push(entry.dataKey)
     args.push(this.token)
-    for (const entry of entries) args.push(entry.buffer, entry.ttlSeconds)
+    for (const entry of entries) args.push(entry.buffer, entry.ttlMs)
     return (await this.redis.swrCommitAndRelease(1 + entries.length, args)) === '1'
   }
 
-  async release(): Promise<boolean> {
+  async release() {
     return (await this.redis.swrReleaseLock(this.key, this.token)) === '1'
   }
 }

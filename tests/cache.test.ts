@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createSwrClient, SwrNoCache, SwrValidationError } from '../src/index.ts'
 import { createRedisKeys } from '../src/keys.ts'
+import { COOLDOWN_MARKER } from '../src/lock.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createFakeRedis } from './fake-redis.ts'
 import { decodeEnvelope, encodeEnvelope } from './helpers/envelope.ts'
@@ -78,7 +79,7 @@ for (const { value, ttl } of [
   { value: null, ttl: 0.25 },
   { value: 'found', ttl: 2.1 },
 ]) {
-  test(`TTL callback: cold fetch resolves value ${String(value)} once and writes rounded EX`, async (t) => {
+  test(`TTL callback: cold fetch resolves value ${String(value)} once and writes ms-precision PX`, async (t) => {
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
     const inputs: unknown[] = []
@@ -98,13 +99,13 @@ for (const { value, ttl } of [
       freshUntilMs: 1000 + ttl * 1000,
       expiresAtMs: 1000 + ttl * 2000,
     })
-    assert.equal(await redis.pttl(toDataKey('ttl:id')), Math.max(1, Math.ceil(ttl * 2)) * 1000)
+    assert.equal(await redis.pttl(toDataKey('ttl:id')), Math.ceil(ttl * 2000))
     assert.equal(await redis.get(toLockKey('ttl:id')), null)
     assert.equal(await cache.get('id'), value)
     assert.equal(inputs.length, 1)
   })
 
-  test(`TTL callback: set value ${String(value)} resolves context and writes rounded EX`, async (t) => {
+  test(`TTL callback: set value ${String(value)} resolves context and writes ms-precision PX`, async (t) => {
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
     const inputs: unknown[] = []
@@ -123,8 +124,7 @@ for (const { value, ttl } of [
     assert.deepEqual(inputs, [{ context: 'id', key: 'set:id', value }])
     assert.equal(await cache.get('id'), value)
     assert.equal(inputs.length, 1)
-    const exMs = Math.max(1, Math.ceil(ttl * 2)) * 1000
-    assert.equal(await redis.pttl(toDataKey('set:id')), exMs)
+    assert.equal(await redis.pttl(toDataKey('set:id')), Math.ceil(ttl * 2000))
     const stored = decodeEnvelope((await redis.getBuffer(toDataKey('set:id')))!)
     assert.equal(stored.freshUntilMs, 1000 + ttl * 1000)
     assert.equal(stored.expiresAtMs, 1000 + ttl * 2000)
@@ -163,7 +163,7 @@ test('TTL callback: stale refresh resolves its new value lifetime with static un
   })
 })
 
-test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional deadline before Redis EX', async (t) => {
+test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional deadline while Redis still holds the key', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   let calls = 0
@@ -178,14 +178,17 @@ test('staleMultiplier: 1 hard cutoff is a cold miss at the exact fractional dead
     },
   })
   assert.equal(await cache.get(), null)
+  assert.equal(await redis.pttl(toDataKey('hard-cutoff')), 250)
+  // Simulate Redis expiry lagging the header (command latency or reader clock skew).
+  await redis.pexpire(toDataKey('hard-cutoff'), 5000)
   redis.advanceTime(249)
   assert.equal(await cache.get(), null)
   assert.equal(calls, 1)
   redis.advanceTime(1)
   assert.ok(await redis.getBuffer(toDataKey('hard-cutoff')))
-  // A stale hit would return null in 'swr' mode; a cold miss surfaces the fetch failure.
+  // A stale hit would return null with the default staleWait 0; a cold miss surfaces the failure.
   await assert.rejects(cache.get(), (error) => error === failure)
-  assert.equal(await redis.get(toLockKey('hard-cutoff')), null)
+  assert.equal(await redis.get(toLockKey('hard-cutoff')), COOLDOWN_MARKER)
 })
 
 for (const phase of ['cold', 'stale', 'set'] as const) {
@@ -206,7 +209,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
       const cache = createSwrClient({
         redis,
         memory: true,
-        mode: 'swr-serverless',
+        runtime: 'serverless',
       }).cache({
         key: 'invalid-ttl',
         ttl: () => (invalidResult ? invalid : 1),
@@ -222,7 +225,9 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
         `ttl=${String(invalid)}`,
       )
       assert.deepEqual(await redis.getBuffer(toDataKey('invalid-ttl')), before)
-      assert.equal(await redis.get(toLockKey('invalid-ttl')), null)
+      // A failure after the fetch still cools the key down.
+      const lock = phase === 'set' ? null : COOLDOWN_MARKER
+      assert.equal(await redis.get(toLockKey('invalid-ttl')), lock)
       if (phase === 'set') {
         assert.equal(await cache.get(), 'existing')
         assert.equal(await cache.get(undefined, { memory: false }), 'existing')
@@ -238,7 +243,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
     const cache = createSwrClient({
       redis,
       memory: true,
-      mode: 'swr-serverless',
+      runtime: 'serverless',
     }).cache({
       key: 'throw-ttl',
       ttl: () => {
@@ -258,12 +263,13 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
         (error) => error === failure,
       )
     assert.deepEqual(await redis.getBuffer(toDataKey('throw-ttl')), before)
-    assert.equal(await redis.get(toLockKey('throw-ttl')), null)
+    const lock = phase === 'set' ? null : COOLDOWN_MARKER
+    assert.equal(await redis.get(toLockKey('throw-ttl')), lock)
     if (phase === 'set') assert.equal(await cache.get(), 'existing')
   })
 }
 
-// In 'swr' mode a stale read returns the stored value and refreshes in the background,
+// With the default staleWait 0 a stale read returns the stored value and refreshes in the background,
 // so fresh, stale, and expired reads are distinguishable by result and fetch count.
 for (const { name, now, expected, fetches } of [
   { name: 'before freshness boundary', now: 1999, expected: 'writer', fetches: 0 },

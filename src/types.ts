@@ -3,18 +3,23 @@ import type { SwrTimeoutError } from './errors.ts'
 import type { SwrNoCache, SwrWriteBatch } from './wrappers.ts'
 
 /**
- * How stale entries (past `ttl`, before `ttl * staleMultiplier`) are handled:
- * - `'swr'`: Lock winner returns stale and refreshes in the background; other callers return stale.
- * - `'swr-serverless'`: Lock winner refreshes inline and returns the fresh value; other callers return stale.
- * - `'wait-on-stale'`: Lock winner refreshes inline; other callers wait up to `waitTimeout` for the fresh value, then fall back to stale.
+ * What happens when no `waitUntil` hook is present:
+ * - `'server'`: Work may continue after `get()` returns, so a lock winner holding stale data can
+ *   return it while its refresh runs.
+ * - `'serverless'`: Work may freeze once the response is sent, so a lock winner holding stale
+ *   data waits for its refresh, bounded by `fetchTimeout`.
  */
-export type SwrMode = 'swr' | 'swr-serverless' | 'wait-on-stale'
+export type SwrRuntime = 'server' | 'serverless'
+
+/** Deadline reported by a `SwrTimeoutError`: the waiting limit, or `fetchTimeout`. */
+export type SwrTimeoutPhase = 'wait' | 'fetch'
 
 /**
- * Behavior when Redis fails or a wait exceeds `waitTimeout` and no stale value can be served.
- * Both strategies return an unexpired stale value when one is available.
- * - `'availability'`: Fetch from source without caching; report failed `set`/`invalidate` calls via `onEvent`.
- * - `'protect-source'`: Reject on pre-fetch Redis errors, failed explicit writes or invalidations, and wait timeouts.
+ * Behavior when Redis fails and no stale value can be served. Both strategies return an
+ * unexpired stale value when one is available.
+ * - `'availability'`: Fetch from source without caching, sharing one fetch per key within a cache
+ *   instance; report failed `set`/`invalidate` calls via `onEvent`.
+ * - `'protect-source'`: Reject on pre-fetch Redis errors and failed explicit writes or invalidations.
  */
 export type SwrFailureStrategy = 'availability' | 'protect-source'
 
@@ -65,21 +70,28 @@ export interface SwrSharedOptions {
   ttl?: number
   /** Multiplier on `ttl` for total Redis lifetime (`ttl * staleMultiplier`). Set `1` to disable the stale window. Must be >= 1. Default: `5`. */
   staleMultiplier?: number
-  /** Stale revalidation mode. Default: `'swr'`. */
-  mode?: SwrMode
-  /** Behavior on Redis errors or wait timeouts when no stale value is available. Default: `'availability'`. */
+  /** Behavior on Redis errors when no stale value is available. Default: `'availability'`. */
   failureStrategy?: SwrFailureStrategy
+  /**
+   * Limit in seconds for each source call, including background refreshes. On expiry the fetch's
+   * `signal` aborts and a late result is discarded. Also bounds how long a caller polls while
+   * another fetch holds the lock. Default: `30`.
+   */
+  fetchTimeout?: number
+  /**
+   * Seconds a caller holding usable stale data waits for fresh data (`0` returns stale
+   * immediately, `Infinity` waits until the refresh settles). Default: `0`.
+   */
+  staleWait?: number
+  /** Seconds a key rests after a fetch fails or times out (`0` disables). Default: `1`. */
+  failureCooldown?: number
   /** zlib compression settings for Redis payloads. Default: `{ level: 1, minBytes: 256 }`. */
   compression?: SwrCompressionOption
-  /** Initial fetch lock TTL in seconds, renewed automatically while `fetch` runs. Default: `3`. */
+  /** Fetch lock TTL in seconds, renewed while `fetch` runs. Controls how quickly a crashed fetcher is detected. Default: `3`. */
   lockTtl?: number
-  /** Maximum duration in seconds a single fetch keeps renewing its lock (Redis command latency can extend the lock slightly past this). Default: `Math.max(30, lockTtl)`. */
-  maxLockTtl?: number
-  /** Time budget in seconds for polling while another caller holds the lock. Default: `10`. */
-  waitTimeout?: number
-  /** Base interval in milliseconds between poll checks while waiting (plus up to 30% jitter). Default: `80`. */
-  pollIntervalMs?: number
-  /** Predicate marking fetch errors that should throw instead of falling back to a stale value (only rejects the refreshing caller). */
+  /** Base interval in seconds between poll checks while waiting (plus up to 30% jitter). Default: `0.08`. */
+  pollInterval?: number
+  /** Predicate marking fetch errors that should throw instead of falling back to a stale value (only rejects a caller still waiting for the refresh). */
   isFatal?: (err: unknown) => boolean
 }
 
@@ -88,6 +100,8 @@ export interface SwrClientOptions extends SwrSharedOptions {
   redis: Redis
   /** Namespace prefix isolating every Redis key written by this client. Default: `'default'`. */
   prefix?: string
+  /** Whether work may outlive a response when no `waitUntil` hook is present. Default: `'server'`. */
+  runtime?: SwrRuntime
   /** Process-local in-memory LRU cache shared across caches on this client (`true` uses default options). Default: `false`. */
   memory?: boolean | SwrMemoryOptions
   /** Default codec for caches on this client. Default: BSON. */
@@ -95,28 +109,37 @@ export interface SwrClientOptions extends SwrSharedOptions {
   /** Telemetry callback for client and cache events. Errors thrown or rejected by this callback are ignored. */
   onEvent?: (event: SwrEvent) => void
   /**
-   * Serverless lifecycle hook for background `'swr'` refreshes (e.g. Vercel `waitUntil`,
-   * Next.js `after`). Overridden per call by `SwrGetOptions.waitUntil`.
+   * Keep-alive hook that receives every refresh promise (e.g. Vercel `waitUntil`, Next.js
+   * `after`), allowing background work under either `runtime`. Overridden per call by
+   * `SwrGetOptions.waitUntil`.
    */
   waitUntil?: (promise: Promise<unknown>) => void
 }
 
 export interface SwrGetOptions {
-  /** Cancels waiting and is forwarded to inline `fetch` calls. Ignored by background `'swr'` refreshes. */
+  /**
+   * Cancels this call, checked between steps. Rejects with `signal.reason` and detaches the caller
+   * without aborting a shared fetch. Pass `AbortSignal.timeout(ms)` for a request deadline.
+   */
   signal?: AbortSignal
+  /** Overrides `staleWait` (in seconds) for this call. */
+  staleWait?: number
   /** Skip memory cache reads and writes for this call. */
   memory?: false
   /**
-   * Per-request lifecycle hook (e.g. Cloudflare `ctx.waitUntil`) for a background `'swr'` refresh
-   * started by this call. Overrides the client `waitUntil`.
+   * Per-request keep-alive hook (e.g. Cloudflare `ctx.waitUntil`) for a refresh started by this
+   * call. Overrides the client `waitUntil`.
    */
   waitUntil?: (promise: Promise<unknown>) => void
 }
 
 export interface SwrFetchMeta<Context = void> {
   key: (context: Context) => string
-  /** The caller's `AbortSignal`, or `undefined` during background `'swr'` refreshes. */
-  signal?: AbortSignal
+  /**
+   * Owned by the library, never the caller's: aborts on `fetchTimeout`, or for a fallback fetch
+   * when every caller waiting for it has left.
+   */
+  signal: AbortSignal
   /** `'attempt'` for normal fetches; `'skip'` during fallback fetches that write nothing to cache. */
   cacheWrite: 'attempt' | 'skip'
 }
@@ -148,8 +171,12 @@ export interface SwrWriteBatchInput<T> {
 /** A fetched value, optionally wrapped in `SwrWriteBatch` or `SwrNoCache`. */
 export type SwrFetchResult<T> = T | SwrWriteBatch<T> | SwrNoCache<T>
 
-// Keep the fetched result separate from the cached value so inference can unwrap it afterwards.
-export interface SwrCacheDefinition<T, Context, Result> extends Omit<SwrSharedOptions, 'ttl'> {
+// Keep `Result` separate from `T` so inference can unwrap `SwrNoCache` / `SwrWriteBatch` afterwards.
+export interface SwrCacheOptions<
+  T = unknown,
+  Context = void,
+  Result = SwrFetchResult<T>,
+> extends Omit<SwrSharedOptions, 'ttl'> {
   key: string | ((context: Context) => string)
   /** May return a value, `SwrNoCache`, or `SwrWriteBatch`. */
   fetch: (context: Context, meta: SwrFetchMeta<Context>) => Promise<Result>
@@ -163,12 +190,6 @@ export interface SwrCacheDefinition<T, Context, Result> extends Omit<SwrSharedOp
   codec?: SwrCodec<T>
 }
 
-export interface SwrCacheOptions<T = unknown, Context = void> extends SwrCacheDefinition<
-  T,
-  Context,
-  SwrFetchResult<T>
-> {}
-
 /** Writer-set deadlines of a cached value, as wall-clock milliseconds. */
 export interface SwrEntryTiming {
   readonly cachedAtMs: number
@@ -181,7 +202,7 @@ export interface SwrEntryTiming {
  * came from:
  * - `'memory'`: in-memory LRU cache hit.
  * - `'redis'`: read from Redis by this call, including values written by another caller and stale
- *   values returned while a background refresh runs or after a refresh fails.
+ *   values returned while a refresh runs or after a refresh fails or times out.
  * - `'fetch'`: returned from this call's own `fetch`.
  */
 export type SwrGetResult<T> =
@@ -215,14 +236,14 @@ export interface SwrClient {
   cache: {
     // Infer the complete result before unwrapping; plain objects resembling wrappers stay intact.
     <Result, Context = void>(
-      options: SwrCacheDefinition<SwrUnwrapFetchResult<Result>, Context, Result>,
+      options: SwrCacheOptions<SwrUnwrapFetchResult<Result>, Context, Result>,
     ): SwrCache<SwrUnwrapFetchResult<Result>, Context>
     // Explicit type arguments describe the cached value, allowing SwrNoCache and SwrWriteBatch in fetch.
     <T = unknown, Context = void>(options: SwrCacheOptions<T, Context>): SwrCache<T, Context>
   }
   /** Removes one or more logical keys and their locks from memory and Redis. */
   invalidateKeys: (...keys: string[]) => Promise<void>
-  /** Waits for all in-flight background refreshes started by this client to settle. */
+  /** Waits for all in-flight refreshes started by this client, including their Redis cleanup, to settle. */
   flush: () => Promise<void>
 }
 
@@ -244,7 +265,7 @@ export type SwrErrorEvent = { type: 'error'; cache?: string; key: string } & (
       severity: 'warn'
       err: unknown
     }
-  | { reason: 'timeout'; severity: 'error'; err: SwrTimeoutError; durationMs: number }
+  | { reason: 'timeout'; severity: 'warn' | 'error'; err: SwrTimeoutError; durationMs: number }
   | { reason: 'lock_lost'; severity: 'warn'; durationMs: number }
 )
 

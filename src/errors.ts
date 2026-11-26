@@ -1,6 +1,6 @@
-import type { SwrNonEmptyKeys } from './types.ts'
+import type { SwrNonEmptyKeys, SwrTimeoutPhase } from './types.ts'
 
-/** Base class for errors thrown by `swr-redis`. Always treated as fatal if thrown from `fetch`. */
+/** Base class for errors thrown by `swr-redis`. Treated as fatal if thrown from `fetch`, except `SwrTimeoutError`. */
 export class SwrCacheError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
@@ -8,21 +8,27 @@ export class SwrCacheError extends Error {
   }
 }
 
-export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boolean): boolean {
-  if (err instanceof SwrCacheError) return true
+export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boolean) {
+  // A timeout from a nested cache is an ordinary failure; a custom isFatal can still match it.
+  if (err instanceof SwrCacheError && !(err instanceof SwrTimeoutError)) return true
   return customIsFatal?.(err) ?? false
 }
 
-/** Thrown under `'protect-source'` when waiting exceeds `waitTimeout` with no stale value to serve. */
+/**
+ * Thrown when the waiting limit (`'wait'`) or `fetchTimeout` (`'fetch'`) expires with no usable
+ * stale value to serve. `elapsedMs` is measured from the start of that phase.
+ */
 export class SwrTimeoutError extends SwrCacheError {
   readonly key: string
   readonly elapsedMs: number
+  readonly phase: SwrTimeoutPhase
 
-  constructor(key: string, elapsedMs: number) {
-    super(`SWR wait timeout exceeded (${elapsedMs}ms) for key: "${key}"`)
+  constructor(key: string, elapsedMs: number, phase: SwrTimeoutPhase) {
+    super(`SWR ${phase} timeout exceeded (${elapsedMs}ms) for key: "${key}"`)
     this.name = 'SwrTimeoutError'
     this.key = key
     this.elapsedMs = elapsedMs
+    this.phase = phase
   }
 }
 

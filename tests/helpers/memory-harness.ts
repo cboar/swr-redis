@@ -10,6 +10,7 @@ import type {
   SwrCacheOptions,
   SwrEvent,
   SwrMemoryOptions,
+  SwrRuntime,
   SwrSharedOptions,
 } from '../../src/types.ts'
 import type { TestContext } from 'node:test'
@@ -22,6 +23,7 @@ export function createLruMemory(options: true | SwrMemoryOptions = true): LruMem
 
 export interface MemoryHarnessClientOptions extends SwrSharedOptions {
   onEvent?: (event: SwrEvent) => void
+  runtime?: SwrRuntime
 }
 
 // Uses the real client wiring and fails the test if any key versions leak.
@@ -39,7 +41,7 @@ export function memoryHarness<T, Context = void>(
     redis: commands,
     keys: createRedisKeys(DEFAULTS.prefix),
     memory,
-    options: resolveClientOptions({ pollIntervalMs: 1, ...sharedOptions, memory: true }),
+    options: resolveClientOptions({ pollInterval: 0.001, ...sharedOptions, memory: true }),
     emit: createEventEmitter(onEvent),
   })
   const cache = new SwrCacheImpl<T, Context>(internals, options)

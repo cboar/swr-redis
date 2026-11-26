@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { SwrCacheImpl } from '../src/cache.ts'
 import { createSwrClient, SwrRedisError, SwrWriteBatch } from '../src/index.ts'
 import { createRedisKeys } from '../src/keys.ts'
-import { registerLockCommands } from '../src/lock.ts'
+import { COOLDOWN_MARKER, registerLockCommands } from '../src/lock.ts'
 import { DEFAULTS } from '../src/options.ts'
 import type { SwrCodec, SwrEvent } from '../src/types.ts'
 import { createFakeRedis } from './fake-redis.ts'
@@ -91,7 +91,6 @@ test('Memory: readers honor the writer-owned freshness without calling their own
   const swr = createSwrClient({
     redis,
     memory: { maxEntries: 50, maxTtl: 10 },
-    mode: 'swr-serverless',
   })
   let writerTtlCalls = 0
   const writer = swr.cache<string | null>({
@@ -159,7 +158,7 @@ test('Memory lifetime wiring: stored freshness expires a memory entry before the
   const swr = createSwrClient({
     redis,
     memory: { maxEntries: 50, maxTtl: 0.5 },
-    mode: 'swr-serverless',
+    runtime: 'serverless',
   })
   let fetchCalls = 0
   const cache = swr.cache<string | null>({
@@ -180,13 +179,17 @@ test('Memory lifetime wiring: stored freshness expires a memory entry before the
 const scopes = ['cache', 'request'] as const
 type Scope = (typeof scopes)[number]
 
-function optOutClient(t: TestContext, scope: Scope, options: { ttl?: number; mode?: 'swr' } = {}) {
+function optOutClient(
+  t: TestContext,
+  scope: Scope,
+  options: { ttl?: number; runtime?: 'server' } = {},
+) {
   const { redis, reads } = fakeClient(t)
   const swr = createSwrClient({
     redis,
     memory: true,
-    mode: 'swr-serverless',
-    pollIntervalMs: 1,
+    runtime: 'serverless',
+    pollInterval: 0.001,
     ...options,
   })
   const getOptions = scope === 'request' ? { memory: false as const } : undefined
@@ -242,7 +245,7 @@ test('Memory opt-out (cache and request): background refresh does not populate',
   for (const scope of scopes) {
     const { redis, reads, swr, getOptions, cacheMemory } = optOutClient(t, scope, {
       ttl: 2,
-      mode: 'swr',
+      runtime: 'server',
     })
     let value = 'old'
     const fetch = async () => value
@@ -456,7 +459,7 @@ test('Memory clone: a value structuredClone rejects fails like an encode error, 
               })
             : uncloneable,
       },
-      { mode: 'swr-serverless', onEvent: (event) => events.push(event) },
+      { runtime: 'serverless', onEvent: (event) => events.push(event) },
       createLruMemory({ clone: true }),
     )
     if (path === 'set' || path === 'stale fetch') {
@@ -481,7 +484,8 @@ test('Memory clone: a value structuredClone rejects fails like an encode error, 
     const data = await redis.getBuffer(toDataKey('clone'))
     assert.deepEqual(data && decodeEnvelope(data, codec).value, expected, path)
     assert.equal(await redis.getBuffer(toDataKey('clone:sec')), null, path)
-    assert.equal(await redis.get(toLockKey('clone')), null, path)
+    const lock = path === 'set' ? null : COOLDOWN_MARKER
+    assert.equal(await redis.get(toLockKey('clone')), lock, path)
   }
 
   for (const scope of scopes) {
@@ -494,7 +498,7 @@ test('Memory clone: a value structuredClone rejects fails like an encode error, 
         ...(scope === 'cache' && { memory: false as const }),
         fetch: async () => uncloneable,
       },
-      { mode: 'swr-serverless' },
+      {},
       createLruMemory({ clone: true }),
     )
     if (scope === 'cache') await cache.set(undefined, uncloneable)
@@ -511,7 +515,7 @@ test('Memory clone: a populate clone error propagates on the initial read and on
     const { redis, cache } = memoryHarness<Record<string, unknown>>(
       t,
       { key: 'read-clone', codec, fetch: async () => assert.fail('must not fetch') },
-      { pollIntervalMs: 5, waitTimeout: 1 },
+      { pollInterval: 0.005 },
       createLruMemory({ clone: true }),
     )
     const envelope = encodeEnvelope(
@@ -554,7 +558,7 @@ test('Memory clone: a populate clone error during a stale wait serves the stale 
       codec,
       fetch: async () => ({ fetched: ++fetches }),
     },
-    { mode: 'wait-on-stale', failureStrategy: 'protect-source', onEvent: (e) => events.push(e) },
+    { staleWait: 10, failureStrategy: 'protect-source', onEvent: (e) => events.push(e) },
     createLruMemory({ clone: true }),
   )
   await redis.set(
@@ -596,7 +600,7 @@ test('Memory: a stale Redis read does not take an LRU slot from a fresh entry', 
   const { redis, cache } = memoryHarness<string, string>(
     t,
     { key: (key) => key, fetch: async () => assert.fail('must not fetch') },
-    { mode: 'swr' },
+    {},
     createLruMemory({ maxEntries: 1 }),
   )
   await cache.set('fresh', 'fresh-value')
@@ -677,7 +681,7 @@ test('Memory: a delayed MGET poll cannot repopulate after a completed invalidate
     const { redis, cache } = memoryHarness(
       t,
       { key: 'polled', ttl: 1, fetch: async () => 'fresh' },
-      { mode: 'wait-on-stale' },
+      { staleWait: 10 },
     )
     if (path === 'stale poll') await redis.set(toDataKey('polled'), stored('stale', 1000))
     await redis.set(toLockKey('polled'), 'owner', 'PX', 5000)
@@ -782,16 +786,12 @@ test('Memory: set() during a slow fetch wins; the fetch reports lock_lost and ev
 })
 
 test('Memory: a background batch refresh replaces a still-fresh secondary once flushed', async (t) => {
-  const { redis, cache, internals } = memoryHarness<string, string>(
-    t,
-    {
-      key: (key) => key,
-      ttl: 60,
-      fetch: async () =>
-        new SwrWriteBatch({ primary: 'p-new', secondary: [{ key: 'sec', value: 'sec-new' }] }),
-    },
-    { mode: 'swr' },
-  )
+  const { redis, cache, internals } = memoryHarness<string, string>(t, {
+    key: (key) => key,
+    ttl: 60,
+    fetch: async () =>
+      new SwrWriteBatch({ primary: 'p-new', secondary: [{ key: 'sec', value: 'sec-new' }] }),
+  })
   await redis.set(toDataKey('p'), stored('p-old', 1000))
   await cache.set('sec', 'sec-old')
   assert.equal(await cache.get('p'), 'p-old')
@@ -814,7 +814,7 @@ test('Memory: a cold-poll MGET failure releases read tracking before the direct 
         return 'direct'
       },
     },
-    { pollIntervalMs: 5, waitTimeout: 1 },
+    { pollInterval: 0.005 },
   )
   await redis.set(toLockKey('poll-err'), 'other-owner', 'PX', 5000)
   const mgetBuffer = redis.mgetBuffer.bind(redis)

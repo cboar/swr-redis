@@ -6,6 +6,9 @@ By default, callers get cached values while one process refreshes stale entries.
 
 [Documentation](https://cboar.github.io/swr-redis/) · [npm package](https://www.npmjs.com/package/swr-redis) · [GitHub](https://github.com/cboar/swr-redis)
 
+> [!IMPORTANT]
+> This branch is **v2**, which is in development and not yet published to npm. `npm install swr-redis` installs v1, documented on the [`v1` branch](https://github.com/cboar/swr-redis/tree/v1#readme).
+
 ## Install
 
 ```sh
@@ -66,17 +69,13 @@ To let the next read fetch the updated value, call `userCache.invalidate('u_123'
 
 ## Choose how stale entries are refreshed
 
-Set `mode` on the client or per cache.
-
-- `'swr'` (default) serves the stale value while one caller refreshes it in the background.
-- `'swr-serverless'` makes one caller wait for its refresh while other callers get the stale value.
-- `'wait-on-stale'` lets concurrent callers wait for the refresh and fall back to the stale value when their wait times out.
-
-For background refreshes in serverless runtimes, pass `waitUntil`. On shutdown, call `await swr.flush()` before closing Redis. [Background refresh lifecycle](https://cboar.github.io/swr-redis/consistency/#background-refresh-lifecycle)
+- By default (`staleWait: 0`, `runtime: 'server'`), stale reads return immediately while one process refreshes in the background.
+- Set `staleWait` (on the client, cache, or `get()`) to wait up to that many seconds for fresh data before falling back to the stale value.
+- In serverless runtimes, set `runtime: 'serverless'` (the refreshing caller waits inline) or pass `waitUntil` to keep background refreshes alive. On long-lived servers, call `await swr.flush()` before closing Redis. [Stale handling & lifecycle](https://cboar.github.io/swr-redis/consistency/#stale-handling)
 
 ## Choose what happens when Redis fails
 
-When Redis fails before a fetch, both strategies return an unexpired stale value if one is available. Otherwise, `'availability'` (default) fetches directly from the source without caching, while `failureStrategy: 'protect-source'` rejects the request to limit load on the source. [Failure strategies](https://cboar.github.io/swr-redis/consistency/#failure-strategies)
+When Redis fails before a fetch, both strategies return an unexpired stale value if one is available. Otherwise, `'availability'` (default) runs one shared direct fetch per key per cache instance without caching, while `failureStrategy: 'protect-source'` rejects the request to limit load on the source. [Failure strategies](https://cboar.github.io/swr-redis/consistency/#failure-strategies)
 
 ## Before you deploy
 
@@ -94,5 +93,5 @@ The package is ESM-only, ships TypeScript declarations, and requires Node.js 24+
 - [Configuration](https://cboar.github.io/swr-redis/configuration/) — option defaults and scopes, dynamic TTLs, in-memory LRU caching, codecs, compression, and timeouts.
 - [Fetch results](https://cboar.github.io/swr-redis/fetch-results/) — fetch metadata, skipping cache writes with `SwrNoCache`, and multi-key writes with `SwrWriteBatch`.
 - [Pagination](https://cboar.github.io/swr-redis/pagination/) — offset-paginated caches with optional page prefetching via `swr-redis/pagination`.
-- [Consistency & failures](https://cboar.github.io/swr-redis/consistency/) — revalidation modes, `waitUntil` / `flush`, failure strategies, and write ordering.
+- [Consistency & failures](https://cboar.github.io/swr-redis/consistency/) — stale handling, timeouts, `waitUntil` / `flush`, failure strategies, and write ordering.
 - [Observability & errors](https://cboar.github.io/swr-redis/observability/) — `onEvent` telemetry, typed error classes, and fatal error handling.

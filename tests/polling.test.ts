@@ -2,25 +2,19 @@ import test from 'node:test'
 import { getEventListeners } from 'node:events'
 import assert from 'node:assert/strict'
 import { setImmediate } from 'node:timers/promises'
-import { pollDelayMs } from '../src/cache.ts'
+import { pollDelayMs } from '../src/timing.ts'
 import { createRedisKeys } from '../src/keys.ts'
 import { DEFAULTS } from '../src/options.ts'
 import { createSwrClient, SwrTimeoutError, type SwrEvent } from '../src/index.ts'
 import { encodeEnvelope } from './helpers/envelope.ts'
 import { holdLock, interceptAcquire } from './helpers/acquire.ts'
+import { COOLDOWN_MARKER } from '../src/lock.ts'
 import { createFakeRedis } from './fake-redis.ts'
-import { useRedisClock } from './helpers/clock.ts'
+import { tick, useRedisClock } from './helpers/clock.ts'
 
 const { data: dataKey, lock: lockKey } = createRedisKeys(DEFAULTS.prefix)
 const envelope = (value: string | null, freshUntilMs: number, expiresAtMs = 10_000) =>
   encodeEnvelope({ value, cachedAtMs: 1000, freshUntilMs, expiresAtMs })
-
-// Elapsed-time tests advance both clocks; setImmediate drains command continuations.
-async function tick(t: test.TestContext, redis: ReturnType<typeof createFakeRedis>, ms: number) {
-  redis.advanceTime(ms)
-  t.mock.timers.tick(ms)
-  await setImmediate()
-}
 
 test('pollDelayMs: adds up to 30% jitter and never sleeps past the remaining wait budget', (t) => {
   let random = 0
@@ -44,7 +38,7 @@ test(
     let fetches = 0
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
       onEvent: (event) => {
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },
@@ -102,7 +96,7 @@ test(
     const events: SwrEvent[] = []
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 10,
+      pollInterval: 0.01,
       onEvent: (event) => {
         events.push(event)
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
@@ -149,8 +143,7 @@ test(
     const events: SwrEvent[] = []
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 10,
-      waitTimeout: 0.03,
+      pollInterval: 0.01,
       failureStrategy: 'protect-source',
       onEvent: (event) => {
         events.push(event)
@@ -166,14 +159,15 @@ test(
     })
     const pending = cache.get()
     await waiting.promise
-    await tick(t, redis, 30)
+    // The first two polls see the lock held; it expires at 30ms.
+    for (let elapsed = 0; elapsed < 30; elapsed += 10) await tick(t, redis, 10)
     assert.equal(await pending, 'stolen')
     assert.equal(fetches, 1)
     assert.equal(await redis.get(lockKey('steal')), null)
     assert.ok(await redis.getBuffer(dataKey('steal')))
     assert.deepEqual(events, [
       { type: 'miss', key: 'steal', action: 'wait' },
-      { type: 'poll', key: 'steal', outcome: 'lock_stolen', attempts: 1, durationMs: 30 },
+      { type: 'poll', key: 'steal', outcome: 'lock_stolen', attempts: 3, durationMs: 30 },
       { type: 'refresh', key: 'steal', trigger: 'lock_stolen', durationMs: 0 },
     ])
   },
@@ -181,7 +175,7 @@ test(
 
 for (const failureStrategy of ['availability', 'protect-source'] as const) {
   test(
-    `Cold wait timeout ${failureStrategy}: policy and accurate attempt count`,
+    `Waiting limit under ${failureStrategy}: a cold waiter rejects with SwrTimeoutError('wait') after fetchTimeout without calling the source`,
     { timeout: 2000 },
     async (t) => {
       t.mock.timers.enable({ apis: ['setTimeout'] })
@@ -196,49 +190,125 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
         return origMget(...keys)
       }) as typeof redis.mgetBuffer
       const waiting = Promise.withResolvers<void>()
-      let fetches = 0
       const events: SwrEvent[] = []
       const cache = createSwrClient({
         redis,
         failureStrategy,
-        waitTimeout: 0.03,
-        pollIntervalMs: 10,
+        fetchTimeout: 0.03,
+        pollInterval: 0.01,
         onEvent: (event) => {
           events.push(event)
           if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
         },
-      }).cache({
-        key: 'timeout',
-        fetch: async (_ctx, { cacheWrite }) => {
-          assert.equal(cacheWrite, 'skip')
-          fetches++
-          return 'direct'
-        },
-      })
-      const pending = cache.get()
-      const result =
-        failureStrategy === 'protect-source'
-          ? assert.rejects(
-              pending,
-              (error) => error instanceof SwrTimeoutError && error.key === 'timeout',
-            )
-          : pending.then((value) => assert.equal(value, 'direct'))
+      }).cache({ key: 'timeout', fetch: async () => assert.fail('waiters never call the source') })
+      const result = assert.rejects(
+        cache.get(),
+        (error) =>
+          error instanceof SwrTimeoutError && error.key === 'timeout' && error.phase === 'wait',
+      )
       await waiting.promise
-      await tick(t, redis, 30)
+      for (let elapsed = 0; elapsed < 30; elapsed += 10) await tick(t, redis, 10)
       await result
-      assert.equal(fetches, failureStrategy === 'availability' ? 1 : 0)
-      assert.equal(pollSnapshots, 1)
+      assert.equal(pollSnapshots, 3)
+      assert.equal(await redis.get(lockKey('timeout')), 'owner')
+      assert.equal(events.length, 3)
       assert.deepEqual(events.slice(0, 2), [
         { type: 'miss', key: 'timeout', action: 'wait' },
-        { type: 'poll', key: 'timeout', outcome: 'timeout', attempts: 1, durationMs: 30 },
+        { type: 'poll', key: 'timeout', outcome: 'timeout', attempts: 3, durationMs: 30 },
       ])
-      if (failureStrategy === 'protect-source') {
-        assert.equal(events.length, 3)
-        const error = events[2]
-        assert.ok(error?.type === 'error' && error.reason === 'timeout')
-        assert.equal(error.severity, 'error')
-        assert.equal(error.durationMs, 30)
-      } else assert.equal(events.length, 2)
+      const error = events[2]
+      assert.ok(error?.type === 'error' && error.reason === 'timeout')
+      assert.equal(error.severity, 'error')
+      assert.equal(error.durationMs, 30)
+    },
+  )
+}
+
+for (const recovers of [true, false]) {
+  test(
+    `Waiting through a cooldown: cold waiters keep polling, then one becomes the next attempt and ${recovers ? 'the other reads its value' : 'fails while the other times out'}`,
+    { timeout: 2000 },
+    async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      t.mock.method(Math, 'random', () => 0)
+      const redis = createFakeRedis(1000)
+      useRedisClock(t, redis)
+      const failure = new Error('source failure')
+      const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+      const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+      let waiters = 0
+      const allWaiting = Promise.withResolvers<void>()
+      let fetches = 0
+      const events: SwrEvent[] = []
+      // The waiting limit (80ms) ends before a second marker written at 50ms expires (100ms).
+      const cache = createSwrClient({
+        redis,
+        fetchTimeout: 0.08,
+        failureCooldown: 0.05,
+        pollInterval: 0.01,
+        onEvent: (event) => {
+          events.push(event)
+          if (event.type === 'miss' && event.action === 'wait' && ++waiters === 2) {
+            allWaiting.resolve()
+          }
+        },
+      }).cache({
+        key: 'cooling',
+        fetch: async () => {
+          const attempt = fetches++
+          entered[attempt]!.resolve()
+          await gates[attempt]!.promise
+          if (attempt === 0 || !recovers) throw failure
+          return 'recovered'
+        },
+      })
+
+      const first = cache.get()
+      await entered[0]!.promise
+      const waiting = Promise.allSettled([cache.get(), cache.get()])
+      await allWaiting.promise
+      gates[0]!.resolve()
+      await assert.rejects(first, (err) => err === failure)
+      assert.equal(await redis.get(lockKey('cooling')), COOLDOWN_MARKER)
+
+      for (let elapsed = 0; elapsed < 40; elapsed += 10) await tick(t, redis, 10)
+      assert.equal(fetches, 1, 'nobody fetches while the marker is held')
+      // The marker expires at 50ms.
+      await tick(t, redis, 10)
+      await entered[1]!.promise
+      assert.equal(fetches, 2)
+      gates[1]!.resolve()
+      await setImmediate()
+      for (let elapsed = 50; elapsed < 80; elapsed += 10) await tick(t, redis, 10)
+
+      const results = await waiting
+      assert.equal(fetches, 2)
+      if (recovers) {
+        assert.deepEqual(
+          results.map((r) => r.status === 'fulfilled' && r.value),
+          ['recovered', 'recovered'],
+        )
+        assert.equal(await redis.get(lockKey('cooling')), null)
+      } else {
+        const reasons = results.map((r) => r.status === 'rejected' && r.reason)
+        assert.equal(reasons.filter((reason) => reason === failure).length, 1)
+        assert.equal(
+          reasons.filter((reason) => reason instanceof SwrTimeoutError && reason.phase === 'wait')
+            .length,
+          1,
+        )
+        assert.equal(await redis.get(lockKey('cooling')), COOLDOWN_MARKER)
+      }
+      assert.deepEqual(events.flatMap((e) => (e.type === 'poll' ? [e.outcome] : [])).sort(), [
+        'lock_stolen',
+        recovers ? 'resolved' : 'timeout',
+      ])
+      assert.deepEqual(
+        events.flatMap((e) => (e.type === 'error' ? [`${e.reason}:${e.severity}`] : [])),
+        recovers
+          ? ['fetch_cold_failure:error']
+          : ['fetch_cold_failure:error', 'fetch_cold_failure:error', 'timeout:error'],
+      )
     },
   )
 }
@@ -287,7 +357,7 @@ for (const { name, freshUntilMs, expiresAtMs, accepted, inMemory } of [
     const cache = createSwrClient({
       redis,
       memory: true,
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({
       key: 'deadline',
       ttl: () => assert.fail('read must not resolve reader TTL'),
@@ -333,7 +403,7 @@ test(
     const cache = createSwrClient({
       redis,
       memory: { maxTtl: 1 },
-      pollIntervalMs: 1,
+      pollInterval: 0.001,
     }).cache({
       key: 'cap',
       ttl: () => assert.fail('read TTL'),
@@ -370,8 +440,8 @@ for (const { name, freshUntilMs, expected } of [
     }) as typeof redis.mgetBuffer
     const cache = createSwrClient({
       redis,
-      mode: 'wait-on-stale',
-      pollIntervalMs: 1,
+      staleWait: 10,
+      pollInterval: 0.001,
     }).cache({
       key,
       ttl: () => assert.fail('stored deadlines bypass reader TTL'),
@@ -425,10 +495,8 @@ for (const scenario of ['timeout', 'unlocked'] as const) {
 
       const cache = createSwrClient({
         redis,
-        mode: 'wait-on-stale',
-        failureStrategy: scenario === 'timeout' ? 'protect-source' : 'availability',
-        waitTimeout: 0.03,
-        pollIntervalMs: scenario === 'timeout' ? 10 : 1,
+        staleWait: 0.03,
+        pollInterval: scenario === 'timeout' ? 0.01 : 0.001,
         onEvent: (event) => {
           events.push(event)
           if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
@@ -441,7 +509,7 @@ for (const scenario of ['timeout', 'unlocked'] as const) {
       const pending = cache.get()
       if (scenario === 'timeout') {
         await waiting.promise
-        await tick(t, redis, 30)
+        for (let elapsed = 0; elapsed < 30; elapsed += 10) await tick(t, redis, 10)
       }
       assert.equal(await pending, undefined)
       assert.equal(acquireCalls, 1, 'stale waiter must not attempt lock steal')
@@ -465,8 +533,7 @@ test(
     const waiting = Promise.withResolvers<void>()
     const cache = createSwrClient({
       redis,
-      pollIntervalMs: 100,
-      waitTimeout: 10,
+      pollInterval: 0.1,
       onEvent: (event) => {
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },

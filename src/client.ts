@@ -39,7 +39,7 @@ export function createSwrClient(options: SwrClientOptions): SwrClient {
       }
     },
 
-    async invalidateKeys(...keys: string[]): Promise<void> {
+    async invalidateKeys(...keys: string[]) {
       const [first, ...rest] = keys
       if (first === undefined) return
       for (const key of keys) requireNonEmpty(key, 'key')
@@ -91,7 +91,8 @@ export function createClientInternals(init: ClientInternalsInit): ClientInternal
         await redis.unlink(keys.flatMap((k) => [redisKeys.data(k), redisKeys.lock(k)]))
       } catch (err) {
         memory.settle(pending, 'evict')
-        reportRedisError(keys, err, strategy, emit)
+        const redisError = reportRedisError(keys, err, strategy, emit)
+        if (redisError) throw redisError
         return
       }
       memory.settle(pending, 'evict')

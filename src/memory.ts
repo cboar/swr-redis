@@ -6,7 +6,7 @@ export interface ReadGuard {
   version: number
 }
 
-/** A write to settle into memory; without `envelope` the key is only evicted. */
+// Without envelope, settling only evicts the key.
 export interface MemoryWrite {
   key: string
   envelope?: Envelope<unknown>
@@ -14,7 +14,7 @@ export interface MemoryWrite {
 
 export type PendingWrites = ReadonlyArray<MemoryWrite & { version: number }>
 
-export type SettleOutcome = 'populate' | 'evict'
+type SettleOutcome = 'populate' | 'evict'
 
 export interface MemoryStore {
   readonly clones: boolean
@@ -49,15 +49,15 @@ export class LruMemory implements MemoryStore {
     this.clones = options.clone
   }
 
-  get entryCount(): number {
+  get entryCount() {
     return this.entries.size
   }
 
-  get versionCount(): number {
+  get versionCount() {
     return this.versions.size
   }
 
-  get<T>(key: string, now: number): Envelope<T> | undefined {
+  get<T>(key: string, now: number) {
     const entry = this.entries.get(key)
     if (!entry) return undefined
 
@@ -71,15 +71,15 @@ export class LruMemory implements MemoryStore {
     ) as Envelope<T>
   }
 
-  beginRead(key: string): ReadGuard {
+  beginRead(key: string) {
     return { key, version: this.versions.acquire(key) }
   }
 
-  endRead(guard: ReadGuard | undefined): void {
+  endRead(guard: ReadGuard | undefined) {
     if (guard) this.versions.release(guard.key)
   }
 
-  populate(guard: ReadGuard | undefined, envelope: Envelope<unknown>, now: number): void {
+  populate(guard: ReadGuard | undefined, envelope: Envelope<unknown>, now: number) {
     if (!guard || now - envelope.timing.cachedAtMs >= this.maxTtlMs) return
     if (this.versions.current(guard.key) !== guard.version) return
     if (!this.clones) {
@@ -87,8 +87,8 @@ export class LruMemory implements MemoryStore {
       return
     }
     const value = structuredClone(envelope.value)
-    // structuredClone runs property getters. A getter that calls set() or invalidate() can finish
-    // that write synchronously (its Redis call throws), so check the version again.
+    // structuredClone runs getters; a re-entrant set() or invalidate() that throws synchronously
+    // still settles its version, so re-check before storing.
     if (this.versions.current(guard.key) !== guard.version) return
     this.store(guard.key, { value, timing: envelope.timing })
   }
@@ -101,7 +101,7 @@ export class LruMemory implements MemoryStore {
     }))
   }
 
-  settle(pending: PendingWrites, outcome: SettleOutcome): void {
+  settle(pending: PendingWrites, outcome: SettleOutcome) {
     for (const { key, envelope, version } of pending) {
       const uncontested = this.versions.endWrite(key, version)
       // If another write to the key finished meanwhile, which one Redis applied last is unknown.
@@ -110,7 +110,7 @@ export class LruMemory implements MemoryStore {
     }
   }
 
-  private store(key: string, envelope: Envelope<unknown>): void {
+  private store(key: string, envelope: Envelope<unknown>) {
     if (this.entries.has(key)) {
       this.entries.delete(key)
     } else if (this.entries.size >= this.maxEntries) {
@@ -120,15 +120,15 @@ export class LruMemory implements MemoryStore {
   }
 }
 
-/** Counters bumped by every finished write; a key is tracked only while an operation on it runs. */
+// Per-key write counters; entries exist only while an operation on the key is active.
 class KeyVersions {
   private readonly versions = new Map<string, { version: number; refs: number }>()
 
-  get size(): number {
+  get size() {
     return this.versions.size
   }
 
-  acquire(key: string): number {
+  acquire(key: string) {
     let v = this.versions.get(key)
     if (!v) {
       v = { version: 0, refs: 0 }
@@ -138,12 +138,11 @@ class KeyVersions {
     return v.version
   }
 
-  current(key: string): number {
+  current(key: string) {
     return this.versions.get(key)!.version
   }
 
-  /** Finishes a write; returns false if another write finished since `version` was taken. */
-  endWrite(key: string, version: number): boolean {
+  endWrite(key: string, version: number) {
     const v = this.versions.get(key)!
     const uncontested = v.version === version
     v.version++
@@ -151,7 +150,7 @@ class KeyVersions {
     return uncontested
   }
 
-  release(key: string, v = this.versions.get(key)!): void {
+  release(key: string, v = this.versions.get(key)!) {
     if (--v.refs === 0) this.versions.delete(key)
   }
 }

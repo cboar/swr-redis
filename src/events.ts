@@ -1,4 +1,4 @@
-import { SwrRedisError } from './errors.ts'
+import { SwrRedisError, type SwrTimeoutError } from './errors.ts'
 import type {
   SwrErrorEvent,
   SwrErrorReason,
@@ -39,19 +39,20 @@ type ErrorFields<R extends SwrErrorReason> = Omit<
   'type' | 'cache' | 'key' | 'reason' | 'severity'
 >
 
-const ERROR_SEVERITY: { [R in SwrErrorReason]: ErrorEventFor<R>['severity'] } = {
+type FixedSeverityReason = Exclude<SwrErrorReason, 'timeout'>
+
+const ERROR_SEVERITY: { [R in FixedSeverityReason]: ErrorEventFor<R>['severity'] } = {
   redis_error: 'error',
   redis_error_fallback: 'warn',
   fetch_cold_failure: 'error',
   fatal: 'error',
-  timeout: 'error',
   stale_fallback: 'warn',
   lock_release_failure: 'warn',
   lock_renewal_failure: 'warn',
   lock_lost: 'warn',
 }
 
-export function errorEvent<R extends SwrErrorReason>(
+export function errorEvent<R extends FixedSeverityReason>(
   reason: R,
   key: string,
   fields: ErrorFields<R>,
@@ -60,15 +61,22 @@ export function errorEvent<R extends SwrErrorReason>(
   return { type: 'error', reason, severity, key, ...fields } as ErrorEventFor<R>
 }
 
+export function timeoutEvent(err: SwrTimeoutError, servedStale: boolean): ErrorEventFor<'timeout'> {
+  const severity = servedStale ? 'warn' : 'error'
+  const { key, elapsedMs } = err
+  return { type: 'error', reason: 'timeout', severity, key, err, durationMs: elapsedMs }
+}
+
 export function reportRedisError(
   keys: SwrNonEmptyKeys,
   err: unknown,
   strategy: SwrFailureStrategy,
   emit: Emit | undefined,
-): void {
+) {
   if (strategy === 'protect-source') {
     emit?.(errorEvent('redis_error', keys[0], { keys, err }))
-    throw new SwrRedisError(keys, err)
+    return new SwrRedisError(keys, err)
   }
   emit?.(errorEvent('redis_error_fallback', keys[0], { keys, err }))
+  return undefined
 }
