@@ -35,6 +35,11 @@ const INVALID_OPTION_CASES: InvalidOptionCase[] = [
     },
     expectedFragment: 'ttl',
   },
+  {
+    label: 'oversized stale',
+    options: { stale: Math.floor(Number.MAX_SAFE_INTEGER / 1000) + 1 },
+    expectedFragment: 'ttl',
+  },
   ...([-1, NaN, Infinity, -Infinity] as const).map((stale) => ({
     label: `stale=${String(stale)}`,
     options: { stale },
@@ -162,6 +167,18 @@ test('Options validation: enforces merged cross-layer resolved Redis TTL ceiling
     ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000),
     fetch: async () => 'v',
   })
+
+  // A callback ttl is always positive, so an oversized stale alone fails every write.
+  assert.throws(
+    () =>
+      createSwrClient({ redis }).cache({
+        key: 'callback-ttl-oversized-stale',
+        ttl: () => 1,
+        stale: Math.floor(Number.MAX_SAFE_INTEGER / 1000) + 1,
+        fetch: async () => 'v',
+      }),
+    SwrValidationError,
+  )
 })
 
 test('Options: omitting memory or setting it to false uses Redis on each read', async (t) => {
@@ -263,7 +280,7 @@ test('Options validation: accepts valid boundary values on client and cache over
   })
 })
 
-test('Options inheritance: numeric client TTL and per-cache dynamic override set independent deadlines', async (t) => {
+test('Options inheritance: client ttl and stale, per-cache overrides, and the default stale window set independent deadlines', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
   const swr = createSwrClient({ redis, ttl: 0.2, stale: 0 })
@@ -276,19 +293,28 @@ test('Options inheritance: numeric client TTL and per-cache dynamic override set
       assert.equal(value, null)
       return 1
     },
+    stale: 3,
+    fetch: async () => null,
+  })
+  // The default stale window is 4 * ttl, so an entry stays usable for 5 * ttl.
+  const defaulted = createSwrClient({ redis, ttl: 2 }).cache({
+    key: 'defaulted',
     fetch: async () => null,
   })
   await inherited.get()
   await overridden.get()
+  await defaulted.get()
   assert.equal(calls, 1)
   const keys = createRedisKeys(DEFAULTS.prefix)
-  for (const [key, freshUntilMs] of [
-    ['inherited', 1200],
-    ['overridden', 2000],
+  for (const [key, freshUntilMs, expiresAtMs] of [
+    ['inherited', 1200, 1200],
+    ['overridden', 2000, 5000],
+    ['defaulted', 3000, 11_000],
   ] as const) {
     const stored = decodeEnvelope((await redis.getBuffer(keys.data(key)))!)!
-    assert.equal(stored.freshUntilMs, freshUntilMs)
-    assert.equal(stored.expiresAtMs, freshUntilMs)
+    assert.equal(stored.freshUntilMs, freshUntilMs, key)
+    assert.equal(stored.expiresAtMs, expiresAtMs, key)
+    assert.equal(await redis.pttl(keys.data(key)), expiresAtMs - 1000, key)
   }
 })
 

@@ -79,9 +79,7 @@ export function resolveClientOptions(
   requireNonEmpty(prefix, 'prefix')
   validateFields(shared)
   // A cache may still override these fields, so only check what the client sets.
-  if (shared.ttl !== undefined) {
-    toRedisTtlMs(shared.ttl + (typeof shared.stale === 'number' ? shared.stale : 0))
-  }
+  toRedisTtlMs((shared.ttl ?? 0) + (numeric(shared.stale) ?? 0))
   return {
     prefix,
     runtime,
@@ -101,8 +99,8 @@ export function resolveCacheOptions<T, Context>(
   const { shared } = client
   const ttl = cache.ttl ?? shared.ttl ?? DEFAULTS.ttl
   const stale = cache.stale ?? shared.stale ?? DEFAULTS.stale
-  // A callback stale can only add to a numeric ttl, so a ttl alone may already be too large.
-  if (typeof ttl === 'number') toRedisTtlMs(ttl + (typeof stale === 'number' ? stale : 0))
+  // A callback counts as 0: either numeric part alone can already exceed the limit.
+  toRedisTtlMs((numeric(ttl) ?? 0) + (numeric(stale) ?? 0))
 
   return {
     keyOf: resolveKey(cache.key),

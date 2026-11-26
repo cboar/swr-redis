@@ -78,12 +78,19 @@ test('SwrWriteBatch: writes different value types and codecs to different cache 
   assert.deepEqual(new SwrWriteBatch({ primary: 'only', ttl: 10 }).secondary, [])
 })
 
-test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secondary override)', async (t) => {
+test('SwrWriteBatch: ttl and stale precedence (batch override vs callbacks vs secondary override)', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
-  const swr = createSwrClient({ redis, stale: ({ ttl }) => ttl * 2 })
+  const staleInputs: unknown[] = []
+  const swr = createSwrClient({
+    redis,
+    stale: (input) => {
+      staleInputs.push(input)
+      return input.ttl * 2
+    },
+  })
 
-  // 1. Dynamic TTL callback evaluated once with primary params/value; secondaries inherit or override
+  // 1. Callbacks run once with the primary's params and value; secondaries inherit or override
   const callbackInputs: Array<{ context: string; key: string; value: string | null }> = []
   const dynCache = swr.cache<string | null, string>({
     key: (id) => `dyn:${id}`,
@@ -104,6 +111,7 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
 
   assert.equal(await dynCache.get('primary'), null)
   assert.deepEqual(callbackInputs, [{ context: 'primary', key: 'dyn:primary', value: null }])
+  assert.deepEqual(staleInputs, [{ context: 'primary', key: 'dyn:primary', value: null, ttl: 1 }])
 
   const inheritEnv = decodeEnvelope<string>((await redis.getBuffer(toDataKey('dyn:inherit')))!)
   const longEnv = decodeEnvelope<string>((await redis.getBuffer(toDataKey('dyn:long')))!)
@@ -132,10 +140,12 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
   // (0.1 + 0.2) * 1000 is 300.00000000000006 in floating point; ceil keeps Redis expiry at or after the header.
   assert.equal(await redis.pttl(toDataKey('dyn:short')), 301)
 
-  // 2. Batch TTL overrides configured TTL without invoking callback and supplies secondary default
+  // 2. Batch ttl and stale skip the callbacks and supply the secondary defaults
   const overrideCache = swr.cache({
     key: (id: string) => `override:${id}`,
-    stale: ({ ttl }) => ttl,
+    stale: () => {
+      throw new Error('stale callback should be skipped when batch.stale is set')
+    },
     ttl: () => {
       throw new Error('TTL callback should be skipped when batch.ttl is set')
     },
@@ -143,6 +153,7 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
       new SwrWriteBatch({
         primary: 'primary-val',
         ttl: 10,
+        stale: 5,
         secondary: [
           { key: 'override:inherited', value: 'sec-inherited' },
           { key: 'override:explicit', value: 'sec-explicit', ttl: 30 },
@@ -151,17 +162,18 @@ test('SwrWriteBatch: TTL precedence (batch override vs dynamic callback vs secon
   })
 
   assert.equal(await overrideCache.get('primary'), 'primary-val')
+  assert.equal(staleInputs.length, 1)
   for (const [key, ttl] of [
     ['override:primary', 10],
     ['override:inherited', 10],
     ['override:explicit', 30],
   ] as const) {
-    // Every entry inherits the primary's resolved stale seconds (10).
+    // Every entry inherits the batch's stale seconds (5).
     const env = decodeEnvelope<string>((await redis.getBuffer(toDataKey(key)))!)
     assert.equal(env.cachedAtMs, 1000)
     assert.equal(env.freshUntilMs, 1000 + ttl * 1000)
-    assert.equal(env.expiresAtMs, 1000 + (ttl + 10) * 1000)
-    assert.equal(await redis.pttl(toDataKey(key)), (ttl + 10) * 1000)
+    assert.equal(env.expiresAtMs, 1000 + (ttl + 5) * 1000)
+    assert.equal(await redis.pttl(toDataKey(key)), (ttl + 5) * 1000)
   }
 })
 
@@ -224,43 +236,41 @@ test('SwrWriteBatch: rejects empty keys, primary collisions, and duplicate secon
   assert.equal(await redis.getBuffer(toDataKey('valid-primary')), null)
 })
 
-test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/memory write and starts a cooldown', async (t) => {
-  const badTtls = [
-    0,
-    -2,
-    NaN,
-    Infinity,
-    -Infinity,
-    '10',
-    Math.floor(Number.MAX_SAFE_INTEGER / 1000),
-  ] as unknown as number[]
-
-  for (const badTtl of badTtls) {
+test('SwrWriteBatch: invalid batch or secondary ttl or stale rejects before any Redis write and starts a cooldown', async (t) => {
+  const invalid = [-2, NaN, Infinity, -Infinity, '10']
+  // Valid alone, but overflows the Redis TTL once the lifetime is resolved.
+  const overflow = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
+  for (const [field, bad] of [
+    ...[0, ...invalid, overflow].map((bad) => ['ttl', bad] as const),
+    ...[...invalid, overflow].map((bad) => ['stale', bad] as const),
+  ] as unknown as ['ttl' | 'stale', number][]) {
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
-    const swr = createSwrClient({ redis, memory: true, stale: ({ ttl }) => ttl })
+    const swr = createSwrClient({ redis, stale: ({ ttl }) => ttl })
 
-    const badBatchTtl = swr.cache({
+    const label = `${field}=${String(bad)}`
+    const notCalled = () => {
+      throw new Error('configured callbacks must not run for an invalid batch')
+    }
+    const badBatch = swr.cache({
       key: (id: string) => `bad-batch:${id}`,
-      ttl: () => {
-        throw new Error('configured ttl must not be called when batch.ttl is invalid')
-      },
+      ttl: notCalled,
+      stale: notCalled,
       fetch: async () =>
         new SwrWriteBatch({
           primary: 'p',
-          ttl: badTtl,
+          // validateBatch rejects before the callbacks; an overflow needs both fields set.
+          ...(bad === overflow ? { ttl: 1, stale: 1 } : {}),
+          [field]: bad,
           secondary: [{ key: 'bad-batch:sec', value: 's' }],
         }),
     })
-    await assert.rejects(
-      () => badBatchTtl.get('p'),
-      (err: unknown) => err instanceof SwrValidationError && err.message.includes('ttl'),
-    )
+    await assert.rejects(() => badBatch.get('p'), SwrValidationError, label)
     assert.equal(await redis.get(toLockKey('bad-batch:p')), COOLDOWN_MARKER)
     assert.equal(await redis.getBuffer(toDataKey('bad-batch:p')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-batch:sec')), null)
 
-    const badSecTtl = swr.cache({
+    const badSecondary = swr.cache({
       key: (id: string) => `bad-sec:${id}`,
       ttl: () => 30,
       fetch: async () =>
@@ -268,14 +278,11 @@ test('SwrWriteBatch: invalid batch or secondary TTL rejects before any Redis/mem
           primary: 'p',
           secondary: [
             { key: 'bad-sec:valid-before', value: 'should-not-write', ttl: 10 },
-            { key: 'bad-sec:invalid', value: 'bad', ttl: badTtl },
+            { key: 'bad-sec:invalid', value: 'bad', [field]: bad },
           ],
         }),
     })
-    await assert.rejects(
-      () => badSecTtl.get('p'),
-      (err: unknown) => err instanceof SwrValidationError && err.message.includes('ttl'),
-    )
+    await assert.rejects(() => badSecondary.get('p'), SwrValidationError, label)
     assert.equal(await redis.get(toLockKey('bad-sec:p')), COOLDOWN_MARKER)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:p')), null)
     assert.equal(await redis.getBuffer(toDataKey('bad-sec:valid-before')), null)

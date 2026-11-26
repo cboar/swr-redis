@@ -785,7 +785,7 @@ test('Memory: set() during a slow fetch wins; the fetch reports lock_lost and ev
   assert.equal(await redis.get(toLockKey('versioned')), null)
 })
 
-test('Memory: a background batch refresh replaces a still-fresh secondary once flushed', async (t) => {
+test('Memory: a background batch refresh replaces a still-fresh secondary once drained', async (t) => {
   const { redis, cache, internals } = memoryHarness<string, string>(t, {
     key: (key) => key,
     ttl: 60,

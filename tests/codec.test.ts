@@ -54,11 +54,18 @@ test('Default BSON codec preserves documented data types through Redis with memo
   }
 })
 
-test('32-byte envelope header: small payloads stay raw, large payloads compress, and reader decodes both seamlessly', () => {
+test('Envelope header v1: fixed field offsets, compression by payload size, and readers skip what they may ignore', () => {
   const smallEnv = { value: 'hi', cachedAtMs: 1000, freshUntilMs: 6000, expiresAtMs: 26000 }
   const smallBuf = encodeEnvelope(smallEnv)
   assert.ok(smallBuf.byteLength > ENVELOPE_HEADER_SIZE)
-  assert.equal(smallBuf[4], 0x00)
+  assert.equal(smallBuf[0], 1, 'formatVersion')
+  assert.equal(smallBuf[1], 0, 'flags')
+  assert.equal(smallBuf.readUInt16BE(2), ENVELOPE_HEADER_SIZE, 'headerLength')
+  assert.equal(smallBuf[4], 0, 'compression: none')
+  assert.deepEqual([...smallBuf.subarray(5, 8)], [0, 0, 0], 'reserved bytes')
+  assert.equal(smallBuf.readDoubleBE(8), 6000, 'freshUntilMs')
+  assert.equal(smallBuf.readDoubleBE(16), 26000, 'expiresAtMs')
+  assert.equal(smallBuf.readDoubleBE(24), 1000, 'cachedAtMs')
   assert.deepEqual(readEnvelopeHeader(smallBuf), {
     headerLength: ENVELOPE_HEADER_SIZE,
     deflated: false,
@@ -115,19 +122,20 @@ test('32-byte envelope header: small payloads stay raw, large payloads compress,
   const lowThreshold = encodeEnvelope(lowThresholdEnv, undefined, { level: 6, minBytes: 10 })
   assert.equal(readEnvelopeHeader(lowThreshold)!.deflated, true)
   assert.deepEqual(decodeEnvelope<string>(lowThreshold), lowThresholdEnv)
-})
 
-test('readEnvelopeHeader rejects a truncated slice instead of reading the backing buffer', () => {
-  const envelope = { value: 'x', cachedAtMs: 1, freshUntilMs: 2, expiresAtMs: 3 }
-  const backing = Buffer.concat([
-    Buffer.alloc(8, 0x42),
-    encodeEnvelope(envelope),
-    Buffer.alloc(8, 0x42),
-  ])
-  assert.throws(
-    () => readEnvelopeHeader(backing.subarray(8, 8 + ENVELOPE_HEADER_SIZE - 1)),
-    RangeError,
-  )
+  // Ignorable flags, nonzero reserved bytes, and trailing header bytes (past a u8 length) are skipped.
+  const trailing = Buffer.alloc(300 - ENVELOPE_HEADER_SIZE, 0xee)
+  for (const base of [smallBuf, compressedBuf]) {
+    const extended = Buffer.concat([
+      base.subarray(0, ENVELOPE_HEADER_SIZE),
+      trailing,
+      base.subarray(ENVELOPE_HEADER_SIZE),
+    ])
+    extended.writeUInt16BE(300, 2)
+    extended[1] = 0xf0
+    extended.fill(0xff, 5, 8)
+    assert.deepEqual(decodeEnvelope(extended), decodeEnvelope(base))
+  }
 })
 
 test('Custom codec handles empty payloads and nonzero-offset Uint8Array views cleanly', () => {
@@ -155,6 +163,11 @@ test('Custom codec handles empty payloads and nonzero-offset Uint8Array views cl
   // Also decode from a nonzero-offset view of the outer envelope buffer.
   const padded = Buffer.concat([Buffer.from([1, 2, 3]), viewBuf, Buffer.from([4, 5])])
   assert.deepEqual(decodeEnvelope(padded.subarray(3, 3 + viewBuf.byteLength), viewCodec), viewEnv)
+  // A truncated view must not read the deadlines from the backing buffer.
+  assert.throws(
+    () => readEnvelopeHeader(padded.subarray(3, 3 + ENVELOPE_HEADER_SIZE - 1)),
+    RangeError,
+  )
 })
 
 test('Codecs: a cache codec overrides the client codec, which overrides BSON', async () => {
@@ -223,14 +236,6 @@ test('Custom codec encoding failure starts a cooldown without populating Redis o
     encodeEnvelope({ value: 'redis', cachedAtMs: 1000, freshUntilMs: 5000, expiresAtMs: 10_000 }),
   )
   assert.equal(await reader.get(), 'redis')
-})
-
-test('Envelope decoding surfaces payload and inflate errors', () => {
-  // Envelopes are trusted: only the payload decoders can fail.
-  assert.throws(() => decodeEnvelope(Buffer.alloc(ENVELOPE_HEADER_SIZE, 0x00)))
-  assert.throws(() =>
-    decodeEnvelope(Buffer.concat([Buffer.alloc(ENVELOPE_HEADER_SIZE, 0x01), Buffer.from([0xff])])),
-  )
 })
 
 test('Header-first expiry check skips payload decoding for expired reads and stale poll ticks', async (t) => {
@@ -328,11 +333,12 @@ test('Synchronous decoder crossing deadlines keeps the pre-decode read admission
 
 for (const [path, fault, expectedEvents] of [
   ['initial read', 'decode', []],
-  ['cold poll', 'decode', ['miss:wait', 'poll:error']],
-  ['stale poll', 'decode', ['hit', 'poll:error', 'error']],
-  ['stale poll', 'decompression', ['hit', 'poll:error', 'error']],
-  ['stale poll', 'abort in decoder', ['hit', 'poll:cancelled']],
+  ['cold poll', 'decode', ['miss:wait', 'wait:error']],
+  ['stale poll', 'decode', ['hit', 'wait:error', 'error']],
+  ['stale poll', 'decompression', ['hit', 'wait:error', 'error']],
+  ['stale poll', 'abort in decoder', ['hit', 'wait:cancelled']],
 ] as const) {
+  // A known format with a corrupt payload throws instead of refetching.
   test(`${path} handles ${fault} without fetching`, { timeout: 2000 }, async (t) => {
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
@@ -408,7 +414,7 @@ for (const [path, fault, expectedEvents] of [
     assert.deepEqual(
       events.map((event) =>
         event.type === 'wait'
-          ? `poll:${event.outcome}`
+          ? `wait:${event.outcome}`
           : event.type === 'miss'
             ? `miss:${event.action}`
             : event.type,
@@ -420,6 +426,83 @@ for (const [path, fault, expectedEvents] of [
     assert.equal(fetches, 0)
     assert.deepEqual(await redis.getBuffer(data(key)), broken)
   })
+}
+
+const UNREADABLE_FORMATS: readonly [string, (buffer: Buffer) => void][] = [
+  ['an unknown formatVersion', (buffer) => (buffer[0] = 2)],
+  ['an unknown must-understand flag', (buffer) => (buffer[1] = 0x01)],
+  ['an unknown compression', (buffer) => (buffer[4] = 2)],
+  ['a headerLength below 32', (buffer) => buffer.writeUInt16BE(ENVELOPE_HEADER_SIZE - 1, 2)],
+]
+
+for (const [format, corrupt] of UNREADABLE_FORMATS) {
+  test(
+    `An entry with ${format} reads as a miss on the first read and while waiting, warns, and is overwritten`,
+    { timeout: 2000 },
+    async (t) => {
+      const redis = createFakeRedis(1000)
+      useRedisClock(t, redis)
+      const { data, lock } = createRedisKeys(DEFAULTS.prefix)
+      // Fresh deadlines: a readable entry would be a hit.
+      const unreadable = encodeEnvelope({
+        value: 'newer format',
+        cachedAtMs: 1000,
+        freshUntilMs: 5000,
+        expiresAtMs: 10_000,
+      })
+      corrupt(unreadable)
+      const events: string[] = []
+      const cache = createSwrClient({
+        redis,
+        pollInterval: 0.001,
+        onEvent: (event) =>
+          events.push(
+            event.type === 'error'
+              ? `${event.reason}:${event.severity}:${event.key}`
+              : event.type === 'miss'
+                ? `miss:${event.action}`
+                : event.type === 'wait'
+                  ? `wait:${event.outcome}`
+                  : event.type,
+          ),
+      }).cache({ key: 'k', fetch: async () => 'fetched' })
+
+      // A cold miss, not a stale hit; the commit replaces the entry in this reader's format.
+      await redis.set(data('k'), unreadable)
+      assert.equal(await cache.get(), 'fetched')
+      assert.deepEqual(events, ['unreadable_entry:warn:k', 'miss:fetch', 'refresh'])
+      assert.equal(decodeEnvelope((await redis.getBuffer(data('k')))!).value, 'fetched')
+
+      // A waiter skips the unreadable entry until the lock holder commits a readable one.
+      events.length = 0
+      await redis.set(data('k'), unreadable)
+      await redis.set(lock('k'), 'other-owner', 'PX', 5000)
+      const mgetBuffer = redis.mgetBuffer.bind(redis)
+      let polls = 0
+      redis.mgetBuffer = (async (...keys: string[]) => {
+        if (++polls === 2) {
+          await redis.set(
+            data('k'),
+            encodeEnvelope({
+              value: 'committed',
+              cachedAtMs: 1000,
+              freshUntilMs: 5000,
+              expiresAtMs: 10_000,
+            }),
+          )
+          await redis.unlink(lock('k'))
+        }
+        return mgetBuffer(...keys)
+      }) as typeof redis.mgetBuffer
+      assert.equal(await cache.get(), 'committed')
+      assert.deepEqual(events, [
+        'unreadable_entry:warn:k',
+        'miss:wait',
+        'unreadable_entry:warn:k',
+        'wait:resolved',
+      ])
+    },
+  )
 }
 
 test('Class-based codecs keep their this binding on every encode and decode path', async () => {

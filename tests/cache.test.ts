@@ -31,39 +31,25 @@ test('Redis keys: lone surrogates in prefixes and keys are rejected so they cann
   assert.equal(await ok.get('acct:\uD83D\uDE00'), 'ok')
 })
 
-test('Redis keys: a data key cannot overwrite another cache entry’s active lock', async () => {
-  const redis = createFakeRedis()
-  const swr = createSwrClient({ redis })
-  const entered = Promise.withResolvers<void>()
-  const release = Promise.withResolvers<void>()
-  let calls = 0
-  const a = swr.cache({
-    key: 'item',
-    fetch: async () => {
-      calls++
-      entered.resolve()
-      await release.promise
-      return 'a'
-    },
-  })
-  const b = swr.cache({ key: 'lock:item', fetch: async () => 'b' })
+// Redis Cluster hashes only the text between the first `{` and the next `}`, when nonempty.
+function hashTag(name: string) {
+  const open = name.indexOf('{')
+  const close = name.indexOf('}', open + 1)
+  return open !== -1 && close > open + 1 ? name.slice(open + 1, close) : name
+}
 
-  const first = a.get()
-  await entered.promise
-  try {
-    assert.equal(await b.get(), 'b')
-  } finally {
-    release.resolve()
+test('Redis keys: type letter first and hash tag last, so data and lock share a Cluster slot', () => {
+  const keys = createRedisKeys('app')
+  assert.equal(keys.data('user:42'), 'SWR2:D:YXBw:{user:42}')
+  assert.equal(keys.lock('user:42'), 'SWR2:L:YXBw:{user:42}')
+  for (const key of ['user:42', 'a{b}c', 'a}b', '{x}']) {
+    assert.equal(hashTag(keys.data(key)), hashTag(keys.lock(key)), key)
+    assert.notEqual(hashTag(keys.data(key)), keys.data(key), key)
   }
-  assert.equal(await first, 'a')
-  assert.equal(await a.get(), 'a')
-  assert.equal(await b.get(), 'b')
-  assert.equal(calls, 1)
 })
 
 test('Redis keys: client prefixes isolate entries without delimiter collisions', async () => {
   const redis = createFakeRedis()
-  assert.equal(createRedisKeys('app').data('k'), 'SWR2:D:YXBw:{k}')
   const pairs: readonly [string, string][] = [
     ['a', 'b:c'],
     ['a:b', 'c'],
@@ -192,27 +178,25 @@ test('stale: 0 hard cutoff is a cold miss at the exact fractional deadline while
 })
 
 for (const phase of ['cold', 'stale', 'set'] as const) {
-  test(`TTL validation: ${phase} rejects invalid callback results before changing Redis or memory`, async (t) => {
-    for (const invalid of [
-      0,
-      -1,
-      NaN,
-      Infinity,
-      -Infinity,
-      '5',
-      undefined,
-      null,
-    ] as unknown as number[]) {
+  test(`Lifetime validation: ${phase} rejects invalid ttl and stale callback results before changing Redis or memory`, async (t) => {
+    const invalidResults = [-1, NaN, Infinity, -Infinity, '5', undefined, null]
+    for (const [option, invalid] of [
+      ...[0, ...invalidResults].map((invalid) => ['ttl', invalid] as const),
+      ...invalidResults.map((invalid) => ['stale', invalid] as const),
+    ] as unknown as ['ttl' | 'stale', number][]) {
       const redis = createFakeRedis(1000)
       useRedisClock(t, redis)
       let invalidResult = phase === 'cold'
+      const resolve = (name: 'ttl' | 'stale') => () =>
+        invalidResult && option === name ? invalid : 1
       const cache = createSwrClient({
         redis,
         memory: true,
         runtime: 'serverless',
       }).cache({
         key: 'invalid-ttl',
-        ttl: () => (invalidResult ? invalid : 1),
+        ttl: resolve('ttl'),
+        stale: resolve('stale'),
         fetch: async () => 'existing',
       })
       if (phase !== 'cold') await cache.set(undefined, 'existing')
@@ -222,7 +206,7 @@ for (const phase of ['cold', 'stale', 'set'] as const) {
       await assert.rejects(
         phase === 'set' ? cache.set(undefined, 'replacement') : cache.get(),
         SwrValidationError,
-        `ttl=${String(invalid)}`,
+        `${option}=${String(invalid)}`,
       )
       assert.deepEqual(await redis.getBuffer(toDataKey('invalid-ttl')), before)
       // A failure after the fetch still cools the key down.
@@ -355,7 +339,7 @@ test('getWithMeta reports source and timing across fetch, memory, Redis, and sta
   await swr.drain()
 })
 
-test('getWithMeta omits timing for uncached SwrNoCache and fallback fetches', async () => {
+test('getWithMeta omits timing for uncached SwrNoCache and reports fallback fetches as direct', async () => {
   const redis = createFakeRedis()
   const swr = createSwrClient({ redis })
   const noCache = swr.cache({
@@ -375,4 +359,9 @@ test('getWithMeta omits timing for uncached SwrNoCache and fallback fetches', as
     value: 'direct',
     source: 'direct',
   })
+  const noCacheFallback = swr.cache({
+    key: 'no-cache-fallback',
+    fetch: async () => new SwrNoCache('direct-nc'),
+  })
+  assert.deepEqual(await noCacheFallback.getWithMeta(), { value: 'direct-nc', source: 'direct' })
 })

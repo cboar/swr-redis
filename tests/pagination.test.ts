@@ -142,22 +142,33 @@ test('createSwrPaginatedCache: pre-warms secondary pages and caps over-returning
     title: `Article ${i + 1}`,
   }))
 
+  const keyInputs: unknown[] = []
   const cache = createSwrPaginatedCache(swr, {
     name: 'articles',
     pageSize: 10,
     prefetchPages: 2,
     ttl: 30,
     pageIndex: (ctx: QueryCtx) => ctx.pageIndex,
-    key: ({ context: ctx, pageIndex: page, pageSize: size }) =>
-      `articles:${ctx.topic}:p${page}:s${size}`,
+    key: (input) => {
+      keyInputs.push(input)
+      const { context: ctx, pageIndex: page, pageSize: size } = input
+      return `articles:${ctx.topic}:p${page}:s${size}`
+    },
     fetch: async (_ctx, { skip, limit }) => {
       dbQueries++
       return { docs: allArticles.slice(skip, skip + limit), totalDocs: allArticles.length }
     },
   })
 
-  const page0 = await cache.get({ topic: 'news', pageIndex: 0 })
+  const context = { topic: 'news', pageIndex: 0 }
+  const page0 = await cache.get(context)
   assert.equal(dbQueries, 1)
+  // The requested page, then each prefetched page, with the caller's context.
+  assert.deepEqual(keyInputs, [
+    { context, pageIndex: 0, pageSize: 10 },
+    { context, pageIndex: 1, pageSize: 10 },
+    { context, pageIndex: 2, pageSize: 10 },
+  ])
   assert.equal(page0.docs.length, 10)
   assert.equal(page0.totalDocs, 25)
 

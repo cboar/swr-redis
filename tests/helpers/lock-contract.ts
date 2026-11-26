@@ -19,6 +19,9 @@ export function lockContract(
       const redis = registerLockCommands(raw)
       const alpha = new RedisLock(redis, 'lock:user:123')
       const beta = new RedisLock(redis, 'lock:user:123')
+      // Tokens are 8 raw random bytes, so length alone separates them from the cooldown marker.
+      assert.ok(Buffer.isBuffer(alpha.token) && alpha.token.length === 8)
+      assert.notDeepEqual(alpha.token, beta.token)
 
       assert.equal(await alpha.acquire(5000), 'acquired')
       assert.deepEqual(await redis.getBuffer(alpha.key), alpha.token)

@@ -3,6 +3,7 @@ import {
   createSwrClient,
   SwrNoCache,
   SwrWriteBatch,
+  type SwrRedisError,
   type SwrCache,
   type SwrCacheWrite,
   type SwrEntryTiming,
@@ -11,6 +12,8 @@ import {
   type SwrGetResult,
   type SwrRuntime,
   type SwrSharedOptions,
+  type SwrStaleInput,
+  type SwrStaleOption,
   type SwrTimeoutPhase,
   type SwrTtlInput,
   type SwrTtlOption,
@@ -20,6 +23,7 @@ import {
 } from '../../src/index.ts'
 import {
   createSwrPaginatedCache,
+  type SwrPageKeyInput,
   type SwrPaginatedCacheOptions,
   type SwrPaginatedPage,
   type SwrPaginationRange,
@@ -45,7 +49,11 @@ expectType<Promise<void>>(settingsCache.invalidate())
 expectType<string>(settingsCache.key())
 declare const getResult: SwrGetResult<{ theme: 'dark' }>
 expectType<'memory' | 'redis' | 'fetch' | 'direct'>(getResult.source)
+// Every member declares timing, so it is readable on the whole union.
 expectType<SwrEntryTiming | undefined>(getResult.timing)
+if (getResult.source === 'memory' || getResult.source === 'redis')
+  expectType<SwrEntryTiming>(getResult.timing)
+if (getResult.source === 'direct') expectType<undefined>(getResult.timing)
 
 // Function key -> Context is inferred from key and flows into fetch.
 const userCache = swr.cache({
@@ -140,6 +148,45 @@ swr.cache({ key: 'k', ttl: async () => 10, fetch: async () => 'a' })
 // @ts-expect-error NoInfer prevents the ttl callback from overriding the fetched value type.
 swr.cache({ key: 'k', ttl: ({ value }: { value: number }) => value, fetch: async () => 'a' })
 
+// stale is a number or a synchronous callback that also receives the resolved ttl.
+createSwrClient({ redis, stale: 0 })
+createSwrClient({
+  redis,
+  stale: ({ ttl, value }) => {
+    expectType<unknown>(value)
+    return ttl * 4
+  },
+})
+const staleCache = swr.cache({
+  key: (id: number) => `stale:${id}`,
+  stale: ({ context, key, value, ttl }) => {
+    expectType<number>(context)
+    expectType<string>(key)
+    expectType<string | null>(value)
+    expectType<number>(ttl)
+    return value === null ? 0 : ttl * 4
+  },
+  fetch: async (id: number): Promise<string | null> => (id > 0 ? 'ok' : null),
+})
+expectType<Promise<string | null>>(staleCache.get(1))
+const staleOption: SwrStaleOption<string, number> = (input: SwrStaleInput<string, number>) =>
+  input.ttl + input.context
+void staleOption
+// @ts-expect-error Dynamic stale callback cannot return a Promise.
+swr.cache({ key: 'k', stale: async () => 10, fetch: async () => 'a' })
+// @ts-expect-error staleMultiplier was replaced by stale.
+createSwrClient({ redis, staleMultiplier: 5 })
+
+// invalidateKeys takes an array, and drain waits for in-flight refreshes.
+const keyList: readonly string[] = ['a', 'b']
+expectType<Promise<void>>(swr.invalidateKeys(keyList))
+expectType<Promise<void>>(swr.invalidateKeys([]))
+// @ts-expect-error invalidateKeys no longer takes a rest parameter.
+swr.invalidateKeys('a', 'b')
+expectType<Promise<void>>(swr.drain())
+// @ts-expect-error flush was renamed to drain.
+void swr.flush
+
 // staleWait can be set per call. fetchTimeout and failureCooldown protect the source, and runtime
 // describes the deployment, so none of them can.
 createSwrClient({
@@ -192,7 +239,23 @@ createSwrClient({ redis, now: () => 0 })
 // Event unions narrow by type, and error events narrow by reason.
 declare const evt: SwrEvent
 if (evt.type === 'hit') expectType<'memory' | 'redis'>(evt.source)
+// Every member declares key, so it is readable on the whole union.
+expectType<string | undefined>(evt.key)
+if (evt.type !== 'error') expectType<string>(evt.key)
+if (evt.type === 'wait') {
+  expectType<'resolved' | 'lock_takeover' | 'timeout' | 'stale_fallback' | 'cancelled' | 'error'>(
+    evt.outcome,
+  )
+  // @ts-expect-error lock_stolen was renamed to lock_takeover.
+  if (evt.outcome === 'lock_stolen') void evt
+}
+if (evt.type === 'refresh')
+  expectType<'cold_miss' | 'stale_revalidation' | 'lock_takeover'>(evt.trigger)
+// @ts-expect-error The poll event was renamed to wait.
+if (evt.type === 'poll') void evt
 if (evt.type === 'error') {
+  // @ts-expect-error Client-wide errors have no key.
+  expectType<string>(evt.key)
   expectType<'warn' | 'error'>(evt.severity)
   expectType<SwrErrorReason>(evt.reason)
   if (evt.reason === 'redis_error' || evt.reason === 'redis_error_fallback')
@@ -213,11 +276,24 @@ if (evt.type === 'error') {
     // @ts-expect-error A lost lock carries no error.
     void evt.err
   }
+  if (evt.reason === 'unreadable_entry') {
+    expectType<'warn'>(evt.severity)
+    // @ts-expect-error An unreadable entry carries no error.
+    void evt.err
+  }
   // @ts-expect-error Only redis_error* events carry keys.
   if (evt.reason === 'fatal') void evt.keys
   // @ts-expect-error The operation field was removed.
   void evt.operation
 }
+
+declare const redisError: SwrRedisError
+expectType<string | undefined>(redisError.key)
+expectType<readonly string[]>(redisError.keys)
+// @ts-expect-error Client-wide errors have no key.
+expectType<string>(redisError.key)
+// @ts-expect-error SwrNonEmptyKeys is internal.
+type NonEmptyKeys = import('../../src/index.ts').SwrNonEmptyKeys
 
 // Wrappers unwrap in inference, and plain look-alike objects stay ordinary values.
 const unionCache = swr.cache({
@@ -227,8 +303,9 @@ const unionCache = swr.cache({
     if (id === 'batch') {
       return new SwrWriteBatch({
         primary: { id, ok: true },
+        stale: 30,
         secondary: [
-          { key: 'counter', value: 123, ttl: 15 },
+          { key: 'counter', value: 123, ttl: 15, stale: 0 },
           { key: 'label', value: 'heading', codec: stringCodec },
         ],
       })
@@ -271,7 +348,10 @@ const articles = createSwrPaginatedCache(swr, {
   pageSize: 10,
   prefetchPages: 2,
   pageIndex: (ctx: ArticleQuery) => ctx.pageIndex,
-  key: ({ context: ctx, pageIndex, pageSize }) => `articles:${ctx.topic}:${pageIndex}:${pageSize}`,
+  key: (input) => {
+    expectType<SwrPageKeyInput<ArticleQuery>>(input)
+    return `articles:${input.context.topic}:${input.pageIndex}:${input.pageSize}`
+  },
   fetch: async (ctx, range, meta) => {
     expectType<number>(range.limit)
     expectType<'attempt' | 'skip'>(meta.cacheWrite)
@@ -297,6 +377,14 @@ createSwrPaginatedCache(swr, {
   key: ({ pageIndex: p, pageSize: s }) => `invalid:${p}:${s}`,
   // @ts-expect-error Primitive fetch result does not satisfy SwrPaginationData | SwrNoCache.
   fetch: async () => 42,
+})
+
+createSwrPaginatedCache(swr, {
+  pageSize: 10,
+  pageIndex: (ctx: { page: number }) => ctx.page,
+  // @ts-expect-error key takes one input object, not positional arguments.
+  key: (_ctx: { page: number }, p: number, s: number) => `positional:${p}:${s}`,
+  fetch: async () => [1],
 })
 
 // Pagination options default to a void context.

@@ -130,14 +130,14 @@ test(
 )
 
 test(
-  'Lock stealing: a waiter takes over an expired lock, fetches once, and releases it',
+  'Lock takeover: a waiter takes over an expired lock, fetches once, and releases it',
   { timeout: 2000 },
   async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] })
     t.mock.method(Math, 'random', () => 0)
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
-    await holdLock(redis, lockKey('steal'), 30, 'crashed')
+    await holdLock(redis, lockKey('takeover'), 30, 'crashed')
     const waiting = Promise.withResolvers<void>()
     let fetches = 0
     const events: SwrEvent[] = []
@@ -150,25 +150,25 @@ test(
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },
     }).cache({
-      key: 'steal',
+      key: 'takeover',
       fetch: async (_ctx, { cacheWrite }) => {
         assert.equal(cacheWrite, 'attempt')
         fetches++
-        return 'stolen'
+        return 'taken-over'
       },
     })
     const pending = cache.get()
     await waiting.promise
     // The first two polls see the lock held; it expires at 30ms.
     for (let elapsed = 0; elapsed < 30; elapsed += 10) await tick(t, redis, 10)
-    assert.equal(await pending, 'stolen')
+    assert.equal(await pending, 'taken-over')
     assert.equal(fetches, 1)
-    assert.equal(await redis.get(lockKey('steal')), null)
-    assert.ok(await redis.getBuffer(dataKey('steal')))
+    assert.equal(await redis.get(lockKey('takeover')), null)
+    assert.ok(await redis.getBuffer(dataKey('takeover')))
     assert.deepEqual(events, [
-      { type: 'miss', key: 'steal', action: 'wait' },
-      { type: 'wait', key: 'steal', outcome: 'lock_takeover', durationMs: 30 },
-      { type: 'refresh', key: 'steal', trigger: 'lock_takeover', durationMs: 0 },
+      { type: 'miss', key: 'takeover', action: 'wait' },
+      { type: 'wait', key: 'takeover', outcome: 'lock_takeover', durationMs: 30 },
+      { type: 'refresh', key: 'takeover', trigger: 'lock_takeover', durationMs: 0 },
     ])
   },
 )

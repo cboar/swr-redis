@@ -49,6 +49,18 @@ test(
     // 60s fresh plus the primary's resolved stale window (30 * 4).
     assert.ok(nextTtl > 170 && nextTtl <= 180, `Expected ~180s, got ${nextTtl}`)
 
+    // `SWR2:?:<ns>:*` matches one namespace's data and lock keys, and no other namespace's.
+    await createSwrClient({ redis, prefix: uniquePrefix('tenant-b') })
+      .cache({ key: 'order', fetch: async () => 'other tenant' })
+      .get()
+    await observer.set(`${keyPrefix}${lockKey('order')}`, 'other-owner', 'PX', 5000)
+    const ns = Buffer.from(swrPrefix).toString('base64url')
+    assert.deepEqual(
+      (await observer.keys(`${keyPrefix}SWR2:?:${ns}:*`)).sort(),
+      [dataKey('order'), dataKey('order:next'), lockKey('order')].map((k) => keyPrefix + k).sort(),
+    )
+    await observer.unlink(`${keyPrefix}${lockKey('order')}`)
+
     // A waiter polls the prefixed data and lock keys with one MGET and resolves on commit.
     await observer.set(`${keyPrefix}${lockKey('polled')}`, 'other-owner', 'PX', 5000)
     const polled = swr.cache<string>({
