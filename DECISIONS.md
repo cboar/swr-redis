@@ -28,28 +28,28 @@ elapsed-time re-checks or millisecond-precision guards for slow synchronous work
 only the caller can fix it. Schedules must still never land exactly on an expiry
 (for example, lock renewal runs every 40% of `lockTtl`).
 
-## Redis leases guard commits
+## Redis locks guard commits
 
-Generating the lease token before the first Redis call lets a retry restore the
-lease after a lost reply and lets cleanup release it even when acquisition was
+Generating the lock token before the first Redis call lets a retry restore the
+lock after a lost reply and lets cleanup release it even when acquisition was
 never acknowledged. Renewals extend by the full `lockTtl` without capping at
-`fetchTimeout`, so the lease is still held when a timed-out fetch swaps it for
+`fetchTimeout`, so the lock is still held when a timed-out fetch swaps it for
 the cooldown marker.
 
-Swapping the lease to a cooldown marker after a failed or timed-out shared fetch
+Swapping the lock to a cooldown marker after a failed or timed-out shared fetch
 limits a failing source to roughly one attempt per key per `failureCooldown`
 across all processes. The swap checks ownership, so a racing `set` or
-`invalidate`, which clears the lease, wins without leaving a cooldown behind.
+`invalidate`, which clears the lock, wins without leaving a cooldown behind.
 
-`set` and `invalidate` clear the lease so a fetch already in flight cannot commit
-older data over them. Batch writes guard only the primary key's lease, so
+`set` and `invalidate` clear the lock so a fetch already in flight cannot commit
+older data over them. Batch writes guard only the primary key's lock, so
 concurrent writers can race on secondary keys. Redis also does not roll back
 earlier commands if a later write in the commit script fails.
 
 ## Lock winners skip a second read
 
-Waiters read the data and lease together with one `MGET` to get a consistent
-snapshot. After acquiring the lease, the winner goes straight to the source to
+Waiters read the data and lock together with one `MGET` to get a consistent
+snapshot. After acquiring the lock, the winner goes straight to the source to
 save a Redis round trip on each refresh. A write between the read and acquisition
 can therefore trigger a redundant fetch and be overwritten. The same gap lets a
 caller repopulate a key after invalidation. A lagging source can make that
@@ -57,7 +57,7 @@ repopulated value out of date for its entire fresh and stale lifetime.
 
 ## Callers attach to a shared refresh
 
-A caller's `signal` or `staleWait` only detaches it from a leased refresh and
+A caller's `signal` or `staleWait` only detaches it from a shared refresh and
 never aborts the fetch: aborting would livelock a key whose callers all give up
 before the source responds. `fetchTimeout` is the fetch's only bound, and late
 results are discarded.
@@ -83,19 +83,18 @@ even when processes are configured with different TTLs. Deadlines use wall-clock
 time, so clock skew between writers and readers affects how long entries appear
 fresh or usable. Redis expiry uses a relative `PX`, not `PEXPIREAT`, so a
 lagging writer clock can't cut the stale window short; readers still check the
-header. Any incompatible envelope change
-must bump the version in the Redis key namespace (`swr:v1` in `src/keys.ts`) so
-old and new formats do not collide.
+header.
 
 ## Fallbacks avoid uncoordinated source load and writes
 
 An expired stale snapshot is never served: if a snapshot expires before a call
 returns it, the call falls back to the cold-miss or error path. Without a usable
-snapshot, decode, decompression, and memory-clone errors throw instead of
-refetching so a codec mismatch or corrupt entry cannot trigger a fetch storm.
+snapshot, decode, decompression, and memory-clone errors for known envelope
+formats throw instead of refetching so a codec mismatch or corrupt entry cannot
+trigger a fetch storm.
 
 Direct fallback fetches under `availability` skip all cache writes because they
-hold no lease. Because nothing is cached, the last attached caller to leave
+hold no lock. Because nothing is cached, the last attached caller to leave
 aborts the shared direct fetch—nobody else can use its result.
 
 ## Memory cache consistency
@@ -107,6 +106,6 @@ clients can still serve their own fresh copies until expiry or eviction.
 
 To preserve that guarantee, concurrent or uncertain local writes evict the
 memory entry so the next read goes to Redis: client replies alone cannot
-establish which value Redis kept. Even a commit that reports a lost lease is
+establish which value Redis kept. Even a commit that reports a lost lock is
 uncertain, because a lost reply followed by a resend can apply the write on the
-first attempt before the retry finds the lease gone.
+first attempt before the retry finds the lock gone.

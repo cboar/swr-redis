@@ -30,7 +30,8 @@ const products = createSwrPaginatedCache(swr, {
   prefetchPages: 2,
   ttl: 120,
   pageIndex: (query: ProductQuery) => query.pageIndex,
-  key: (query, page, size) => `products:${query.categoryId}:p${page}:s${size}`,
+  key: ({ context, pageIndex, pageSize }) =>
+    `products:${context.categoryId}:p${pageIndex}:s${pageSize}`,
   fetch: async (query, { skip, limit }, { signal }) => {
     const [docs, totalDocs] = await Promise.all([
       db.findProducts(query.categoryId, { skip, limit, signal }),
@@ -58,10 +59,10 @@ returns it.
   again inside `fetch`. `pageIndex` must return a non-negative safe integer;
   `pageSize` (a number or `(context) => number`) must be a positive safe
   integer.
-- **Build keys from all inputs.** `key(context, page, size)` runs for the
-  requested page and every prefetched page. Use the `page` and `size` arguments
-  (not `context`) so prefetched pages get distinct keys, and include every
-  filter and sort field from `context`.
+- **Build keys from all inputs.** `key({ context, pageIndex, pageSize })` runs
+  for the requested page and every prefetched page. Use `pageIndex` and
+  `pageSize` from the input (not `context`) so prefetched pages get distinct
+  keys, and include every filter and sort field from `context`.
 - **Sort with a unique tiebreaker.** End your `ORDER BY` with a unique column
   such as `id` so tied rows stay in a stable order across queries. Note that
   offset pagination can still shift rows between pages when rows are inserted or
@@ -79,8 +80,8 @@ requested page; remaining items are sliced into up to `prefetchPages` additional
 pages and committed via [`SwrWriteBatch`](/swr-redis/fetch-results/).
 Trailing empty pages are not written.
 
-- All written pages share `totalDocs`, the resolved TTL (a `ttl` callback runs
-  once for the requested page), `codec`, and `compression`.
+- All written pages share `totalDocs`, the resolved `ttl` and `stale` windows
+  (their callbacks run once for the requested page), `codec`, and `compression`.
 - During a [fallback fetch](/swr-redis/consistency/#failure-strategies)
   (`cacheWrite: 'skip'`), `fetch` receives `limit = pageSize` and returns only
   the requested page.
