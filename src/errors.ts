@@ -14,10 +14,7 @@ export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boo
   return customIsFatal?.(err) ?? false
 }
 
-/**
- * Thrown when the waiting limit (`'wait'`) or `fetchTimeout` (`'fetch'`) expires with no usable
- * stale value to serve. `elapsedMs` is measured from the start of that phase.
- */
+/** Thrown when the waiting limit (`'wait'`) or `fetchTimeout` (`'fetch'`) expires with no usable stale value to serve. */
 export class SwrTimeoutError extends SwrCacheError {
   readonly key: string
   readonly elapsedMs: number
@@ -34,7 +31,6 @@ export class SwrTimeoutError extends SwrCacheError {
 
 /** Thrown under `'protect-source'` when Redis fails before a fetch with no stale value to serve, or during `set`, `invalidate`, or `invalidateKeys`. */
 export class SwrRedisError extends SwrCacheError {
-  /** The first affected logical key, if the operation had one. */
   readonly key?: string
   readonly keys: readonly string[]
 

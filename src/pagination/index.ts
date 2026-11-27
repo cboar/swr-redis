@@ -42,9 +42,9 @@ export interface SwrPaginatedCacheOptions<TItem = unknown, Context = void> exten
     range: SwrPaginationRange,
     meta: SwrFetchMeta<Context>,
   ) => Promise<SwrPaginationData<TItem> | SwrNoCache<SwrPaginationData<TItem>>>
-  /** Pure function returning the 0-based page index (runs for key building and inside `fetch`). */
+  /** Pure function returning the 0-based page index. */
   pageIndex: (context: Context) => number
-  /** Positive safe integer, or a pure function (runs for key building and inside `fetch`). */
+  /** Page size, or a pure function returning it. */
   pageSize: number | ((context: Context) => number)
   /** Additional following pages to fetch and cache in the same write. Default: `0`. */
   prefetchPages?: number

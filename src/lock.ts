@@ -116,7 +116,6 @@ export function registerLockCommands(redis: Redis): SwrRedis {
 
 export class RedisLock {
   readonly key: string
-  // Raw bytes: Lua compares strings byte for byte and ioredis sends Buffers unchanged.
   readonly token = randomBytes(8)
   private readonly redis: SwrRedis
 

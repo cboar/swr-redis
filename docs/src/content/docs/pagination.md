@@ -55,10 +55,9 @@ returns it.
 
 ## Pagination rules
 
-- **Keep `pageIndex` and `pageSize` pure.** Both run once to build the key and
-  again inside `fetch`. `pageIndex` must return a non-negative safe integer;
-  `pageSize` (a number or `(context) => number`) must be a positive safe
-  integer.
+- **Keep `pageIndex` and `pageSize` pure.** Both run to build the key and
+  again inside `fetch`. `pageIndex` is 0-based; `pageSize` can be a number or
+  `(context) => number`.
 - **Build keys from all inputs.** `key({ context, pageIndex, pageSize })` runs
   for the requested page and every prefetched page. Use `pageIndex` and
   `pageSize` from the input (not `context`) so prefetched pages get distinct
@@ -80,8 +79,8 @@ requested page; remaining items are sliced into up to `prefetchPages` additional
 pages and committed via [`SwrWriteBatch`](/swr-redis/fetch-results/).
 Trailing empty pages are not written.
 
-- All written pages share `totalDocs`, the resolved `ttl` and `stale` windows
-  (their callbacks run once for the requested page), `codec`, and `compression`.
+- All written pages share `totalDocs`, the requested page's `ttl` and `stale`,
+  `codec`, and `compression`.
 - During a [fallback fetch](/swr-redis/consistency/#failure-strategies)
   (`cacheWrite: 'skip'`), `fetch` receives `limit = pageSize` and returns only
   the requested page.

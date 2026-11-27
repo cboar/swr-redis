@@ -15,11 +15,11 @@ Durations are in seconds.
 | Option | Set on | Description |
 | --- | --- | --- |
 | `redis` | Client | Required. Your `ioredis` connection. |
-| `prefix` | Client | Namespace isolating every Redis key written by this client (stored as `SWR2:D:<base64url(prefix)>:{<key>}` and `SWR2:L:<base64url(prefix)>:{<key>}`). Default: `'default'`. |
+| `prefix` | Client | Namespace isolating every Redis key written by this client. Default: `'default'`. |
 | `key` | Cache | Required. Static string, or `(context) => string`. |
 | `fetch` | Cache | Required. `(context, meta) => Promise<value>`. See [fetch results](/swr-redis/fetch-results/). |
 | `ttl` | Client, cache | Fresh lifetime in seconds. A cache can pass a callback. Default: `120`. |
-| `stale` | Client, cache | Seconds an entry stays usable as stale after `ttl` (`0` disables the stale window), or a synchronous callback `({ context, key, value, ttl }) => number`. Total Redis lifetime is `ttl + stale`. Default: `({ ttl }) => ttl * 4`. |
+| `stale` | Client, cache | Seconds an entry stays usable as stale after `ttl` (`0` disables the stale window), or a callback. Total Redis lifetime is `ttl + stale`. Default: `({ ttl }) => ttl * 4`. |
 | `staleWait` | Client, cache, `get()` | Seconds a caller holding stale data waits for fresh data (`0` returns stale immediately, `Infinity` waits until settled). Default: `0`. |
 | `runtime` | Client | What happens without a `waitUntil` hook: `'server'` (background work allowed) or `'serverless'` (lock winner waits inline). Default: `'server'`. |
 | `fetchTimeout` | Client, cache | Seconds a single `fetch` call may run; also bounds how long waiters wait. Default: `30`. |
@@ -55,12 +55,7 @@ const userById = swr.cache({
 Place `fetch` before `ttl` and `stale` so TypeScript infers `value` (or annotate
 `fetch` / pass explicit type arguments `swr.cache<User | null, string>()`).
 
-Callbacks run when preparing a cache write from `fetch` or `set()`. Return a
-positive finite number for `ttl` and a non-negative finite number for `stale`.
 Other clients reading the same key use the lifetime chosen by the writer.
-
-Migrating from `staleMultiplier`: replace `staleMultiplier: m` with
-`stale: ({ ttl }) => ttl * (m - 1)`, and `staleMultiplier: 1` with `stale: 0`.
 
 ## Cache values in memory
 

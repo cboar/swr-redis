@@ -78,7 +78,7 @@ export interface SwrSharedOptions {
   ttl?: number
   /**
    * Seconds an entry stays usable as stale after its fresh `ttl` ends (`0` disables the stale
-   * window), or a synchronous callback resolved on write. Default: `({ ttl }) => ttl * 4`.
+   * window), or a callback. Default: `({ ttl }) => ttl * 4`.
    */
   stale?: SwrStaleOption<unknown, unknown>
   /** Behavior on Redis errors when no stale value is available. Default: `'availability'`. */
@@ -175,9 +175,9 @@ export interface SwrCacheWrite {
 
 export interface SwrWriteBatchInput<T> {
   primary: T
-  /** Fresh lifetime in seconds for this batch. Overrides the cache `ttl` and skips its callback. */
+  /** Fresh lifetime in seconds for this batch. Overrides the cache `ttl`. */
   ttl?: number
-  /** Stale window in seconds after `ttl`. Overrides the cache `stale` and skips its callback. */
+  /** Stale window in seconds after `ttl`. Overrides the cache `stale`. */
   stale?: number
   /** Additional entries committed with `primary` under the primary key's lock. */
   secondary?: readonly SwrCacheWrite[]
@@ -195,9 +195,9 @@ export interface SwrCacheOptions<
   key: string | ((context: Context) => string)
   /** May return a value, `SwrNoCache`, or `SwrWriteBatch`. */
   fetch: (context: Context, meta: SwrFetchMeta<Context>) => Promise<Result>
-  /** Fresh lifetime in seconds, or a synchronous callback resolved on write. Default: client `ttl` (`120`). */
+  /** Fresh lifetime in seconds, or a callback. Default: client `ttl` (`120`). */
   ttl?: SwrTtlOption<NoInfer<T>, NoInfer<Context>>
-  /** Stale window in seconds after `ttl`, or a synchronous callback resolved on write. Default: client `stale`. */
+  /** Stale window in seconds after `ttl`, or a callback. Default: client `stale`. */
   stale?: SwrStaleOption<NoInfer<T>, NoInfer<Context>>
   /** Disable the client's in-memory cache for this cache. */
   memory?: false
@@ -261,16 +261,14 @@ export interface SwrClient {
     // Explicit type arguments describe the cached value, allowing SwrNoCache and SwrWriteBatch in fetch.
     <T = unknown, Context = void>(options: SwrCacheOptions<T, Context>): SwrCache<T, Context>
   }
-  /** Removes logical keys and their locks from memory and Redis. An empty array does nothing. */
+  /** Removes logical keys and their locks from memory and Redis. */
   invalidateKeys: (keys: readonly string[]) => Promise<void>
   /** Waits for all in-flight refreshes started by this client, including their Redis cleanup, to settle. */
   drain: () => Promise<void>
 }
 
-// One or more logical keys; the first is reported as `key`.
 export type SwrNonEmptyKeys = readonly [string, ...string[]]
 
-// `keys` is empty for client-wide operations, which also have no `key`.
 export type SwrErrorEvent = { type: 'error'; cache?: string; key?: string } & (
   | { reason: 'redis_error'; severity: 'error'; keys: readonly string[]; err: unknown }
   | { reason: 'redis_error_fallback'; severity: 'warn'; keys: readonly string[]; err: unknown }
@@ -293,7 +291,6 @@ export type SwrErrorEvent = { type: 'error'; cache?: string; key?: string } & (
 
 export type SwrErrorReason = SwrErrorEvent['reason']
 
-// Open union: every member declares `cache?` and `key` (optional where absent).
 export type SwrEvent =
   | {
       type: 'hit'

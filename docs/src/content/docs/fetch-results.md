@@ -48,9 +48,9 @@ const profileCache = swr.cache<Profile | null, string>({
 ```
 
 Nothing is written to Redis or memory, existing entries are left untouched, the
-lock is released without a cooldown, the `ttl` and `stale` callbacks do not run,
-and no `refresh` event is emitted. If the caller already detached and returned a
-stale value, the `SwrNoCache` result is discarded.
+lock is released without a cooldown, and no `refresh` event is emitted. If the
+caller already detached and returned a stale value, the `SwrNoCache` result is
+discarded.
 
 ## Write related keys with `SwrWriteBatch`
 
@@ -90,21 +90,18 @@ const userGraphCache = swr.cache({
 ## Batch TTLs, codecs, and validation
 
 - **TTL and stale precedence.** `batch.ttl` and `batch.stale` override the
-  cache's `ttl` and `stale` and skip the matching callback; otherwise the cache
-  resolves them once for `primary`. Secondary entries inherit the primary's
-  resolved `ttl` and resolved `stale` seconds unless they specify their own
-  (unlike `staleMultiplier`, setting a secondary `ttl` alone does not rescale
-  its stale window).
+  cache's `ttl` and `stale` for `primary`. Secondary entries inherit the
+  primary's resolved `ttl` and `stale` unless they specify their own (setting a
+  secondary `ttl` alone does not rescale its `stale` window).
 - **Codec precedence.** `primary` uses the producing cache's `codec`. Secondary
   entries default to the **client's** `codec` unless they specify `codec` — pass
   the target cache's codec when it differs. TypeScript does not check that a
   secondary `value` matches its `codec`.
 - **Shared settings.** Every entry in the batch shares the producing cache's
   `compression` and write timestamp.
-- **Validation.** Empty keys, keys with lone UTF-16 surrogates, duplicate keys
-  (including duplicating the primary key), non-positive or non-finite TTLs, and
-  negative or non-finite `stale` values throw `SwrValidationError` before
-  anything reaches Redis.
+- **Validation.** Invalid keys (empty, duplicate, or containing lone UTF-16
+  surrogates) and invalid `ttl` or `stale` values throw `SwrValidationError`
+  before anything reaches Redis.
 
 ## Commit behavior
 

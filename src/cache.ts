@@ -667,7 +667,6 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     return { key, dataKey, timing, buffer, ttlMs, envelope: { value: memoryValue, timing } }
   }
 
-  // A batch's own ttl or stale skips the matching callback.
   private resolveLifetime(
     context: Context,
     key: string,
@@ -719,7 +718,6 @@ function decodeEntry<T>(buf: Buffer, header: EnvelopeHeader, accept: Accept, cod
   return { envelope: { value, timing }, fresh: now < timing.freshUntilMs, now }
 }
 
-// A secondary inherits each lifetime field it doesn't set from the primary.
 function resolveSecondary(
   write: SwrCacheWrite,
   primary: Lifetime,

@@ -143,7 +143,7 @@ await userCache.invalidate('u_123')
 ```
 
 To remove multiple keys in one call, pass an array of keys to
-`swr.invalidateKeys` using `cache.key` (an empty array does nothing):
+`swr.invalidateKeys` using `cache.key`:
 
 ```ts
 await swr.invalidateKeys([userCache.key('u_123'), userCache.key('u_456')])

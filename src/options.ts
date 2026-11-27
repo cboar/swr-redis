@@ -50,9 +50,7 @@ export interface ResolvedCacheOptions<T, Context> {
   readonly failureStrategy: SwrFailureStrategy
   // Also caps how long a caller waits behind another fetch.
   readonly fetchTimeoutMs: number
-  // 0 or Infinity allowed.
   readonly staleWaitMs: number
-  // 0 disables the cooldown.
   readonly failureCooldownMs: number
   readonly lockTtlMs: number
   readonly pollIntervalMs: number
