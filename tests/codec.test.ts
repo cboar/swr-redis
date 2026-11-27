@@ -443,11 +443,11 @@ for (const [format, corrupt] of UNREADABLE_FORMATS) {
       const redis = createFakeRedis(1000)
       useRedisClock(t, redis)
       const { data, lock } = createRedisKeys(DEFAULTS.prefix)
-      // Fresh deadlines: a readable entry would be a hit.
+      // Inside the stale window: a readable entry would be served stale on both paths.
       const unreadable = encodeEnvelope({
         value: 'newer format',
-        cachedAtMs: 1000,
-        freshUntilMs: 5000,
+        cachedAtMs: 0,
+        freshUntilMs: 500,
         expiresAtMs: 10_000,
       })
       corrupt(unreadable)

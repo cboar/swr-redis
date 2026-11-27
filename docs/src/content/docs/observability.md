@@ -117,7 +117,7 @@ and the cache `name` as `cache` when set.
 | `fetch_cold_failure` | `'error'` | `err` | `fetch` failed without a usable stale value remaining. |
 | `fatal` | `'error'` | `err` | `fetch` threw a fatal error during a stale refresh. |
 | `stale_fallback` | `'warn'` | `stage`, `err` | A stale value was returned after a Redis error (`'redis'`), cache read error (`'read'`), or non-fatal fetch error (`'refresh'`). |
-| `timeout` | `'warn' \| 'error'` | `err`, `durationMs` | `fetchTimeout` or the waiting limit expired (`'warn'` when usable stale data remains). |
+| `timeout` | `'warn' \| 'error'` | `err`, `durationMs` | `fetchTimeout` expired (`'warn'` when usable stale data remains), or a cold wait hit the waiting limit. |
 | `lock_lost` | `'warn'` | `durationMs` | Lock renewal found the lock gone, or `fetch` finished after its lock expired or was cleared; write skipped. |
 | `lock_renewal_failure` | `'warn'` | `err` | Background lock renewal failed while `fetch` ran. |
 | `lock_release_failure` | `'warn'` | `err` | Releasing the lock or writing the cooldown marker failed. |
