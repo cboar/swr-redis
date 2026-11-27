@@ -46,7 +46,7 @@ export function memoryHarness<T, Context = void>(
   })
   const cache = new SwrCacheImpl<T, Context>(internals, options)
   t.after(async () => {
-    await internals.flush()
+    await internals.drain()
     assert.equal(memory.versionCount, 0, 'leaked memory key versions')
   })
 

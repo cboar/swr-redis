@@ -23,7 +23,7 @@ assert.deepEqual(Object.keys(pagination).sort(), ['createSwrPaginatedCache'].sor
 
 const realRedis = new Redis({ lazyConnect: true, retryStrategy: () => null })
 try {
-  await api.createSwrClient({ redis: realRedis }).flush()
+  await api.createSwrClient({ redis: realRedis }).drain()
 } finally {
   realRedis.disconnect()
 }
@@ -104,7 +104,7 @@ const pages = pagination.createSwrPaginatedCache(swr, {
   pageSize: 2,
   prefetchPages: 1,
   pageIndex: (ctx) => ctx.page,
-  key: (_ctx, page, size) => `pkg-page:${page}:${size}`,
+  key: ({ pageIndex: page, pageSize: size }) => `pkg-page:${page}:${size}`,
   fetch: async (_ctx, { skip, limit }) => {
     pageFetches++
     return { docs: ['a', 'b', 'c', 'd'].slice(skip, skip + limit), totalDocs: 4 }
@@ -123,4 +123,4 @@ assert.deepEqual(await pages.get({ page: 1 }), {
   totalDocs: 4,
 })
 assert.equal(pageFetches, 1)
-await swr.flush()
+await swr.drain()

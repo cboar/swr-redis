@@ -6,6 +6,7 @@ import type {
   SwrCacheWrite,
   SwrClient,
   SwrFetchMeta,
+  SwrStaleOption,
   SwrTtlOption,
 } from '../types.ts'
 import { SwrNoCache, SwrWriteBatch } from '../wrappers.ts'
@@ -19,6 +20,12 @@ export interface SwrPaginatedPage<TItem> {
 
 export type SwrPaginationData<TItem> = { docs: TItem[]; totalDocs?: number } | TItem[]
 
+export interface SwrPageKeyInput<Context = void> {
+  context: Context
+  pageIndex: number
+  pageSize: number
+}
+
 export interface SwrPaginationRange {
   skip: number
   limit: number
@@ -29,20 +36,22 @@ export interface SwrPaginatedCacheOptions<TItem = unknown, Context = void> exten
   'key' | 'fetch'
 > {
   /** Use `pageIndex` and `pageSize` (not `context`) so prefetched pages get distinct keys. */
-  key: (context: Context, pageIndex: number, pageSize: number) => string
+  key: (input: SwrPageKeyInput<Context>) => string
   fetch: (
     context: Context,
     range: SwrPaginationRange,
     meta: SwrFetchMeta<Context>,
   ) => Promise<SwrPaginationData<TItem> | SwrNoCache<SwrPaginationData<TItem>>>
-  /** Pure function returning the 0-based page index (runs for key building and inside `fetch`). */
+  /** Pure function returning the 0-based page index. */
   pageIndex: (context: Context) => number
-  /** Positive safe integer, or a pure function (runs for key building and inside `fetch`). */
+  /** Page size, or a pure function returning it. */
   pageSize: number | ((context: Context) => number)
   /** Additional following pages to fetch and cache in the same write. Default: `0`. */
   prefetchPages?: number
   /** Resolved once for the requested page and shared by prefetched pages. */
   ttl?: SwrTtlOption<NoInfer<SwrPaginatedPage<TItem>>, NoInfer<Context>>
+  /** Resolved once for the requested page and shared by prefetched pages. */
+  stale?: SwrStaleOption<NoInfer<SwrPaginatedPage<TItem>>, NoInfer<Context>>
 }
 
 function computePageLimit(pageSize: number, prefetchPages: number) {
@@ -134,7 +143,7 @@ export function createSwrPaginatedCache<TItem = unknown, Context = void>(
 
   const key = (context: Context) => {
     const { pageIndex, pageSize } = resolveParams(context)
-    return keyFn(context, pageIndex, pageSize)
+    return keyFn({ context, pageIndex, pageSize })
   }
 
   return client.cache<SwrPaginatedPage<TItem>, Context>({
@@ -165,7 +174,7 @@ export function createSwrPaginatedCache<TItem = unknown, Context = void>(
           if (offset >= docs.length) break
           const nextPageIndex = pageIndex + i
           secondary.push({
-            key: keyFn(context, nextPageIndex, pageSize),
+            key: keyFn({ context, pageIndex: nextPageIndex, pageSize }),
             value: buildPage(docs, offset, nextPageIndex, pageSize, totalDocs),
             codec: cacheOptions.codec,
           })

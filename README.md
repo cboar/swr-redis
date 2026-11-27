@@ -36,7 +36,7 @@ const swr = createSwrClient({
   redis,
   prefix: 'my-app:prod',
   ttl: 120,
-  staleMultiplier: 5,
+  stale: 480,
 })
 
 const userCache = swr.cache({
@@ -46,7 +46,7 @@ const userCache = swr.cache({
 })
 ```
 
-`prefix` namespaces Redis keys. Entries stay fresh for `ttl` seconds and can be served stale until `ttl * staleMultiplier` seconds after the write.
+`prefix` namespaces Redis keys. Entries stay fresh for `ttl` seconds and can be served stale for `stale` seconds after that (default `({ ttl }) => ttl * 4`).
 
 ## Read and update cached values
 
@@ -65,13 +65,13 @@ const updatedUser = await db.updateUser('u_123', { name: 'Ada' })
 await userCache.set('u_123', updatedUser)
 ```
 
-To let the next read fetch the updated value, call `userCache.invalidate('u_123')` after updating the source. To invalidate several entries, pass their logical keys from `cache.key()` to `swr.invalidateKeys()`.
+To let the next read fetch the updated value, call `userCache.invalidate('u_123')` after updating the source. To invalidate several entries, pass an array of their logical keys from `cache.key()` to `swr.invalidateKeys()`.
 
 ## Choose how stale entries are refreshed
 
 - By default (`staleWait: 0`, `runtime: 'server'`), stale reads return immediately while one process refreshes in the background.
 - Set `staleWait` (on the client, cache, or `get()`) to wait up to that many seconds for fresh data before falling back to the stale value.
-- In serverless runtimes, set `runtime: 'serverless'` (the refreshing caller waits inline) or pass `waitUntil` to keep background refreshes alive. On long-lived servers, call `await swr.flush()` before closing Redis. [Stale handling & lifecycle](https://cboar.github.io/swr-redis/consistency/#stale-handling)
+- In serverless runtimes, set `runtime: 'serverless'` (the refreshing caller waits inline) or pass `waitUntil` to keep background refreshes alive. On long-lived servers, call `await swr.drain()` before closing Redis. [Stale handling & lifecycle](https://cboar.github.io/swr-redis/consistency/#stale-handling)
 
 ## Choose what happens when Redis fails
 
@@ -93,5 +93,5 @@ The package is ESM-only, ships TypeScript declarations, and requires Node.js 24+
 - [Configuration](https://cboar.github.io/swr-redis/configuration/) — option defaults and scopes, dynamic TTLs, in-memory LRU caching, codecs, compression, and timeouts.
 - [Fetch results](https://cboar.github.io/swr-redis/fetch-results/) — fetch metadata, skipping cache writes with `SwrNoCache`, and multi-key writes with `SwrWriteBatch`.
 - [Pagination](https://cboar.github.io/swr-redis/pagination/) — offset-paginated caches with optional page prefetching via `swr-redis/pagination`.
-- [Consistency & failures](https://cboar.github.io/swr-redis/consistency/) — stale handling, timeouts, `waitUntil` / `flush`, failure strategies, and write ordering.
+- [Consistency & failures](https://cboar.github.io/swr-redis/consistency/) — stale handling, timeouts, `waitUntil` / `drain`, failure strategies, and write ordering.
 - [Observability & errors](https://cboar.github.io/swr-redis/observability/) — `onEvent` telemetry, typed error classes, and fatal error handling.

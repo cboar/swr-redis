@@ -4,9 +4,9 @@ description: Configure stale handling, timeouts, serverless lifecycles, Redis fa
 ---
 
 A Redis lock coordinates fetches for each key. On a miss, one caller fetches
-while others wait. When an entry is stale (past `ttl`, before
-`ttl * staleMultiplier`), `staleWait` and `runtime` control whether callers wait
-for fresh data or return stale immediately.
+while others wait. When an entry is stale (past `ttl`, before `ttl + stale`),
+`staleWait` and `runtime` control whether callers wait for fresh data or return
+stale immediately.
 
 ## Stale handling
 
@@ -34,7 +34,7 @@ full refresh (up to `fetchTimeout`) even when holding stale data. Provide a
 
 - **Source limit (`fetchTimeout`).** Every source call, including background
   refreshes, is bounded by `fetchTimeout` (default `30s`). On expiry,
-  `meta.signal` aborts and late results are discarded. Waiters also poll for at
+  `meta.signal` aborts and late results are discarded. Waiters also wait for at
   most `fetchTimeout`. Without a usable stale value, callers receive
   `SwrTimeoutError` (`phase: 'fetch'` or `'wait'`).
 - **Caller deadlines (`signal`).** Pass `signal: AbortSignal.timeout(ms)` to
@@ -48,14 +48,14 @@ full refresh (up to `fetchTimeout`) even when holding stale data. Provide a
 - **Failure cooldown (`failureCooldown`).** When a shared fetch fails or times
   out, the key rests for `failureCooldown` (default `1s`) so a failing source
   sees roughly one attempt per cooldown per key across all processes. Waiting
-  callers holding stale data return it immediately; cold waiters keep polling
+  callers holding stale data return it immediately; cold waiters keep waiting
   until the cooldown expires. `set()` and `invalidate()` clear any active
   cooldown.
 
 ## Background refresh lifecycle
 
 When a refresh can outlive the request, pass `waitUntil` in serverless runtimes
-or call `flush()` before closing Redis on shutdown.
+or call `drain()` before closing Redis on shutdown.
 
 ```ts
 // AWS Lambda (no keep-alive hook): refreshing caller waits inline, bounded by fetchTimeout
@@ -71,7 +71,7 @@ const user = await userCache.get('u_123', {
 })
 
 // Long-running servers: stop accepting requests, drain refreshes, then close Redis
-await swr.flush()
+await swr.drain()
 await redis.quit()
 ```
 
@@ -85,9 +85,10 @@ Set `failureStrategy` on the client or per cache to choose how `swr-redis`
 behaves when Redis fails and no stale value can be served:
 
 - **`'availability'`** (default) fetches directly from the source without
-  caching the result, sharing one in-flight fetch per key within each cache
-  instance (aborted if every attached caller leaves). Failed explicit writes and
-  invalidations are reported through `onEvent`.
+  caching the result (returned with `source: 'direct'` from `getWithMeta()`),
+  sharing one in-flight fetch per key within each cache instance (aborted if
+  every attached caller leaves). Failed explicit writes and invalidations are
+  reported through `onEvent`.
 - **`'protect-source'`** rejects with `SwrRedisError`, as well as rejecting
   failed explicit writes and invalidations. See
   [typed errors](/swr-redis/observability/#errors).
@@ -104,6 +105,10 @@ reject the caller.
 
 If a successfully prepared fetch result fails to reach Redis, the caller still
 receives the fetched value and `onEvent` reports the failure.
+
+Entries written in an unknown or unsupported format are treated as misses on
+every read path (never served stale): a caller takes the lock, refetches, and
+overwrites the entry while emitting an `unreadable_entry` warning.
 
 ## Write ordering
 

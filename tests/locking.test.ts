@@ -47,7 +47,7 @@ test('RedisLock.startRenewal: renews the full lockTtl every 40% of it, without a
   })
   for (let i = 0; i < 10; i++) await tick(t, redis, 40)
   assert.deepEqual(ttls, Array(10).fill(100))
-  assert.equal(await redis.get(lock.key), lock.token)
+  assert.deepEqual(await redis.getBuffer(lock.key), lock.token)
   assert.equal(renewal.lost, false)
 
   renewal.stop()
@@ -122,7 +122,7 @@ test('RedisLock.startRenewal: a negative reply while active marks the lock lost 
 })
 
 for (const outcome of ['resolves', 'rejects'] as const) {
-  test(`Lease renewal: a renewal that finds the lock taken reports lock_lost once, and a fetch that ${outcome} writes nothing`, async (t) => {
+  test(`Lock renewal: a renewal that finds the lock taken reports lock_lost once, and a fetch that ${outcome} writes nothing`, async (t) => {
     t.mock.timers.enable({ apis: ['setInterval'] })
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
@@ -148,7 +148,7 @@ for (const outcome of ['resolves', 'rejects'] as const) {
 
     const pending = cache.getWithMeta()
     const signal = await entered.promise
-    // The lease expired unnoticed and another process took the key.
+    // The lock expired unnoticed and another process took the key.
     await redis.set(toLockKey('renew-lost'), 'other-owner', 'PX', 5000)
     await tick(t, redis, 40)
     await tick(t, redis, 40)
@@ -169,7 +169,7 @@ for (const outcome of ['resolves', 'rejects'] as const) {
   })
 }
 
-test('Lease renewal: a renewal reply delayed past the commit is not reported as lock_lost', async (t) => {
+test('Lock renewal: a renewal reply delayed past the commit is not reported as lock_lost', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] })
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
@@ -211,7 +211,7 @@ test('Lease renewal: a renewal reply delayed past the commit is not reported as 
   )
 })
 
-test('fetchTimeout equal to lockTtl: renewals hold the lease until the timeout, so the cooldown swap succeeds', async (t) => {
+test('fetchTimeout equal to lockTtl: renewals hold the lock until the timeout, so the cooldown swap succeeds', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
@@ -223,7 +223,7 @@ test('fetchTimeout equal to lockTtl: renewals hold the lease until the timeout, 
     fetchTimeout: 0.1,
     onEvent: (event) => events.push(event),
   }).cache({
-    key: 'timeout-lease',
+    key: 'timeout-lock',
     fetch: async (_ctx, { signal }) => {
       entered.resolve(signal)
       return new Promise<string>(() => {})
@@ -239,8 +239,8 @@ test('fetchTimeout equal to lockTtl: renewals hold the lease until the timeout, 
   for (let elapsed = 0; elapsed < 100; elapsed += 20) await tick(t, redis, 20)
   await rejected
   assert.ok(signal.aborted)
-  assert.equal(await redis.get(toLockKey('timeout-lease')), COOLDOWN_MARKER)
-  assert.equal(await redis.pttl(toLockKey('timeout-lease')), 1000)
+  assert.equal(await redis.get(toLockKey('timeout-lock')), COOLDOWN_MARKER)
+  assert.equal(await redis.pttl(toLockKey('timeout-lock')), 1000)
   assert.deepEqual(
     events.flatMap((e) => (e.type === 'error' ? [`${e.reason}:${e.severity}`] : [])),
     ['timeout:error'],

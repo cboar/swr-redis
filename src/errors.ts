@@ -1,4 +1,4 @@
-import type { SwrNonEmptyKeys, SwrTimeoutPhase } from './types.ts'
+import type { SwrTimeoutPhase } from './types.ts'
 
 /** Base class for errors thrown by `swr-redis`. Treated as fatal if thrown from `fetch`, except `SwrTimeoutError`. */
 export class SwrCacheError extends Error {
@@ -14,10 +14,7 @@ export function isFatalError(err: unknown, customIsFatal?: (err: unknown) => boo
   return customIsFatal?.(err) ?? false
 }
 
-/**
- * Thrown when the waiting limit (`'wait'`) or `fetchTimeout` (`'fetch'`) expires with no usable
- * stale value to serve. `elapsedMs` is measured from the start of that phase.
- */
+/** Thrown when the waiting limit (`'wait'`) or `fetchTimeout` (`'fetch'`) expires with no usable stale value to serve. */
 export class SwrTimeoutError extends SwrCacheError {
   readonly key: string
   readonly elapsedMs: number
@@ -34,21 +31,26 @@ export class SwrTimeoutError extends SwrCacheError {
 
 /** Thrown under `'protect-source'` when Redis fails before a fetch with no stale value to serve, or during `set`, `invalidate`, or `invalidateKeys`. */
 export class SwrRedisError extends SwrCacheError {
-  readonly key: string
-  readonly keys: SwrNonEmptyKeys
+  readonly key?: string
+  readonly keys: readonly string[]
 
-  constructor(keys: SwrNonEmptyKeys, cause: unknown) {
+  constructor(keys: readonly string[], cause: unknown) {
     const [key] = keys
     const reason = cause instanceof Error ? cause.message : String(cause)
-    const target = keys.length === 1 ? `key "${key}"` : `${keys.length} keys ("${key}", ...)`
-    super(`SWR Redis error for ${target}: ${reason}`, { cause })
+    const target =
+      keys.length === 0
+        ? ''
+        : keys.length === 1
+          ? ` for key "${key}"`
+          : ` for ${keys.length} keys ("${key}", ...)`
+    super(`SWR Redis error${target}: ${reason}`, { cause })
     this.name = 'SwrRedisError'
     this.key = key
     this.keys = keys
   }
 }
 
-/** Thrown when an option, key, `ttl` callback result, `SwrWriteBatch`, or pagination input is invalid. */
+/** Thrown when an option, key, `ttl` or `stale` callback result, `SwrWriteBatch`, or pagination input is invalid. */
 export class SwrValidationError extends SwrCacheError {
   constructor(message: string) {
     super(message)

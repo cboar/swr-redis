@@ -1,10 +1,11 @@
 import { SwrValidationError } from './errors.ts'
 
+// The hash tag keeps a key's data and lock in one Cluster slot; the base64url prefix has no braces.
 export function createRedisKeys(prefix: string) {
-  const namespace = `swr:v1:${Buffer.from(prefix).toString('base64url')}`
+  const ns = Buffer.from(prefix).toString('base64url')
   return {
-    data: (key: string) => `${namespace}:data:${key}`,
-    lock: (key: string) => `${namespace}:lock:${key}`,
+    data: (key: string) => `SWR2:D:${ns}:{${key}}`,
+    lock: (key: string) => `SWR2:L:${ns}:{${key}}`,
   }
 }
 

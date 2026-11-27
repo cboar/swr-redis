@@ -5,8 +5,8 @@ description: Read fetch metadata, skip caching individual results with SwrNoCach
 
 A cache's `fetch(context, meta)` returns the value to cache. It can also return
 `new SwrNoCache(value)` to skip caching that result, or
-`new SwrWriteBatch({ primary, ttl?, secondary? })` to override the TTL and write
-related keys together. Examples build on `swr` from
+`new SwrWriteBatch({ primary, ttl?, stale?, secondary? })` to override write
+lifetimes and write related keys together. Examples build on `swr` from
 [getting started](/swr-redis/).
 
 ## Fetch metadata
@@ -48,15 +48,15 @@ const profileCache = swr.cache<Profile | null, string>({
 ```
 
 Nothing is written to Redis or memory, existing entries are left untouched, the
-lock is released without a cooldown, the `ttl` callback does not run, and no
-`refresh` event is emitted. If the caller already detached and returned a stale
-value, the `SwrNoCache` result is discarded.
+lock is released without a cooldown, and no `refresh` event is emitted. If the
+caller already detached and returned a stale value, the `SwrNoCache` result is
+discarded.
 
 ## Write related keys with `SwrWriteBatch`
 
 Return a `SwrWriteBatch` to cache the primary value along with related entries.
 Each `secondary` entry takes a logical `key` (built with the target cache's
-`cache.key`), a `value`, and optional `ttl` and `codec` overrides:
+`cache.key`), a `value`, and optional `ttl`, `stale`, and `codec` overrides:
 
 ```ts
 import { SwrWriteBatch } from 'swr-redis'
@@ -77,9 +77,10 @@ const userGraphCache = swr.cache({
     return new SwrWriteBatch({
       primary: graph,
       ttl: 60,
+      stale: 300,
       secondary: [
         { key: accountCache.key(account.id), value: account },
-        { key: `audit:last-seen:${id}`, value: Date.now(), ttl: 30 },
+        { key: `audit:last-seen:${id}`, value: Date.now(), ttl: 30, stale: 60 },
       ],
     })
   },
@@ -88,18 +89,19 @@ const userGraphCache = swr.cache({
 
 ## Batch TTLs, codecs, and validation
 
-- **TTL precedence.** `batch.ttl` overrides the cache's `ttl` and skips its
-  callback; otherwise the cache resolves its `ttl` once for `primary`. Secondary
-  entries inherit that primary TTL unless they specify their own `ttl`.
+- **TTL and stale precedence.** `batch.ttl` and `batch.stale` override the
+  cache's `ttl` and `stale` for `primary`. Secondary entries inherit the
+  primary's resolved `ttl` and `stale` unless they specify their own (setting a
+  secondary `ttl` alone does not rescale its `stale` window).
 - **Codec precedence.** `primary` uses the producing cache's `codec`. Secondary
   entries default to the **client's** `codec` unless they specify `codec` — pass
   the target cache's codec when it differs. TypeScript does not check that a
   secondary `value` matches its `codec`.
 - **Shared settings.** Every entry in the batch shares the producing cache's
-  `compression`, `staleMultiplier`, and write timestamp.
-- **Validation.** Empty keys, keys with lone UTF-16 surrogates, duplicate keys
-  (including duplicating the primary key), and non-positive or non-finite TTLs
-  throw `SwrValidationError` before anything reaches Redis.
+  `compression` and write timestamp.
+- **Validation.** Invalid keys (empty, duplicate, or containing lone UTF-16
+  surrogates) and invalid `ttl` or `stale` values throw `SwrValidationError`
+  before anything reaches Redis.
 
 ## Commit behavior
 

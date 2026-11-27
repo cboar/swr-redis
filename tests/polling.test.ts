@@ -124,20 +124,20 @@ test(
     assert.equal(redis.setCallCount - sets, 1, 'the test write')
     assert.deepEqual(events, [
       { type: 'miss', key: 'passive', action: 'wait' },
-      { type: 'poll', key: 'passive', outcome: 'resolved', attempts: 3, durationMs: 30 },
+      { type: 'wait', key: 'passive', outcome: 'resolved', durationMs: 30 },
     ])
   },
 )
 
 test(
-  'Lock stealing: a waiter takes over an expired lock, fetches once, and releases it',
+  'Lock takeover: a waiter takes over an expired lock, fetches once, and releases it',
   { timeout: 2000 },
   async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] })
     t.mock.method(Math, 'random', () => 0)
     const redis = createFakeRedis(1000)
     useRedisClock(t, redis)
-    await holdLock(redis, lockKey('steal'), 30, 'crashed')
+    await holdLock(redis, lockKey('takeover'), 30, 'crashed')
     const waiting = Promise.withResolvers<void>()
     let fetches = 0
     const events: SwrEvent[] = []
@@ -150,25 +150,25 @@ test(
         if (event.type === 'miss' && event.action === 'wait') waiting.resolve()
       },
     }).cache({
-      key: 'steal',
+      key: 'takeover',
       fetch: async (_ctx, { cacheWrite }) => {
         assert.equal(cacheWrite, 'attempt')
         fetches++
-        return 'stolen'
+        return 'taken-over'
       },
     })
     const pending = cache.get()
     await waiting.promise
     // The first two polls see the lock held; it expires at 30ms.
     for (let elapsed = 0; elapsed < 30; elapsed += 10) await tick(t, redis, 10)
-    assert.equal(await pending, 'stolen')
+    assert.equal(await pending, 'taken-over')
     assert.equal(fetches, 1)
-    assert.equal(await redis.get(lockKey('steal')), null)
-    assert.ok(await redis.getBuffer(dataKey('steal')))
+    assert.equal(await redis.get(lockKey('takeover')), null)
+    assert.ok(await redis.getBuffer(dataKey('takeover')))
     assert.deepEqual(events, [
-      { type: 'miss', key: 'steal', action: 'wait' },
-      { type: 'poll', key: 'steal', outcome: 'lock_stolen', attempts: 3, durationMs: 30 },
-      { type: 'refresh', key: 'steal', trigger: 'lock_stolen', durationMs: 0 },
+      { type: 'miss', key: 'takeover', action: 'wait' },
+      { type: 'wait', key: 'takeover', outcome: 'lock_takeover', durationMs: 30 },
+      { type: 'refresh', key: 'takeover', trigger: 'lock_takeover', durationMs: 0 },
     ])
   },
 )
@@ -214,7 +214,7 @@ for (const failureStrategy of ['availability', 'protect-source'] as const) {
       assert.equal(events.length, 3)
       assert.deepEqual(events.slice(0, 2), [
         { type: 'miss', key: 'timeout', action: 'wait' },
-        { type: 'poll', key: 'timeout', outcome: 'timeout', attempts: 3, durationMs: 30 },
+        { type: 'wait', key: 'timeout', outcome: 'timeout', durationMs: 30 },
       ])
       const error = events[2]
       assert.ok(error?.type === 'error' && error.reason === 'timeout')
@@ -299,8 +299,8 @@ for (const recovers of [true, false]) {
         )
         assert.equal(await redis.get(lockKey('cooling')), COOLDOWN_MARKER)
       }
-      assert.deepEqual(events.flatMap((e) => (e.type === 'poll' ? [e.outcome] : [])).sort(), [
-        'lock_stolen',
+      assert.deepEqual(events.flatMap((e) => (e.type === 'wait' ? [e.outcome] : [])).sort(), [
+        'lock_takeover',
         recovers ? 'resolved' : 'timeout',
       ])
       assert.deepEqual(
@@ -515,7 +515,7 @@ for (const scenario of ['timeout', 'unlocked'] as const) {
       assert.equal(acquireCalls, 1, 'stale waiter must not attempt lock steal')
       assert.equal(fetches, 0)
       assert.deepEqual(
-        events.map((event) => (event.type === 'poll' ? event.outcome : event.type)),
+        events.map((event) => (event.type === 'wait' ? event.outcome : event.type)),
         ['hit', scenario === 'timeout' ? 'timeout' : 'stale_fallback'],
       )
     },

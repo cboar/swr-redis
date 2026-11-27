@@ -50,8 +50,8 @@ All library errors extend `SwrCacheError` (which extends `Error`):
 
 | Class | Thrown when | Useful fields |
 | --- | --- | --- |
-| `SwrValidationError` | An option, key, `ttl` callback result, `SwrWriteBatch`, or pagination input is invalid. | |
-| `SwrRedisError` | Under `'protect-source'`, Redis fails before a fetch with no stale value to serve, or during `set`, `invalidate`, or `invalidateKeys`. | `key`, `keys`, `cause` |
+| `SwrValidationError` | An option, key, `ttl` or `stale` callback result, `SwrWriteBatch`, or pagination input is invalid. | |
+| `SwrRedisError` | Under `'protect-source'`, Redis fails before a fetch with no stale value to serve, or during `set`, `invalidate`, or `invalidateKeys`. | `key?`, `keys`, `cause` |
 | `SwrTimeoutError` | The waiting limit (`'wait'`) or `fetchTimeout` (`'fetch'`) expires with no usable stale value to serve. | `key`, `elapsedMs`, `phase` |
 
 Note that `get(ctx, { signal: AbortSignal.timeout(ms) })` rejects with the
@@ -90,29 +90,22 @@ try {
 }
 ```
 
-`SchemaMismatchError` stands for an application error class. Any `SwrCacheError`
-other than `SwrTimeoutError` thrown inside `fetch` is always fatal (a custom
-`isFatal` can still match `SwrTimeoutError`).
-
-`isFatal` only rejects the lock winner if it is still attached when the error
-occurs; it does not invalidate the cached entry or reject other callers (which
-fall back to stale data once the cooldown starts). Do not rely on `isFatal` for
-security boundaries such as revoked access — enforce authorization outside the
-cache. If the lock winner has already returned stale data, a fatal error emits a
-`'fatal'` error event without rejecting.
+Any `SwrCacheError` other than `SwrTimeoutError` thrown inside `fetch` is always
+fatal. `isFatal` only rejects the lock winner while it is still attached; it does
+not invalidate the entry or reject other callers, so don't use it for security
+boundaries such as revoked access.
 
 ## Events
 
-`SwrEvent` is a discriminated union on `type`. Every event includes `key` (the
-logical key) and optional `cache` (the cache `name`, omitted for
-`swr.invalidateKeys` errors).
+`SwrEvent` is a discriminated union on `type`. Events include the logical `key`
+and the cache `name` as `cache` when set.
 
 | `type` | Fields | Emitted when |
 | --- | --- | --- |
 | `'hit'` | `source` (`'memory' \| 'redis'`), `stale` (`boolean`), `startedRevalidation` (`boolean`) | A fresh entry is served from memory or Redis, or a stale entry is found in Redis. `startedRevalidation` is `true` only for the caller that takes the refresh lock. |
 | `'miss'` | `action` (`'fetch' \| 'wait'`) | A key is missing or expired: `'fetch'` when this caller took the lock, `'wait'` when another caller holds it. |
-| `'poll'` | `outcome`, `attempts`, `durationMs` | A caller finishes waiting for another caller's fetch. `outcome` is `'resolved'`, `'lock_stolen'`, `'stale_fallback'`, `'timeout'`, `'cancelled'`, or `'error'`. |
-| `'refresh'` | `trigger` (`'cold_miss' \| 'stale_revalidation' \| 'lock_stolen'`), `durationMs` | A fetch result is committed to Redis. Omitted for `SwrNoCache`, fallback fetches, lost locks, and failed commits. |
+| `'wait'` | `outcome`, `durationMs` | A caller finishes waiting for another caller's fetch. `outcome` is `'resolved'`, `'lock_takeover'`, `'stale_fallback'`, `'timeout'`, `'cancelled'`, or `'error'`. |
+| `'refresh'` | `trigger` (`'cold_miss' \| 'stale_revalidation' \| 'lock_takeover'`), `durationMs` | A fetch result is committed to Redis. Omitted for `SwrNoCache`, fallback fetches, lost locks, and failed commits. |
 | `'error'` | `reason`, `severity` (`'warn' \| 'error'`), plus reason-specific fields | A Redis, read, or fetch failure, wait timeout, or lock issue occurs (see below). |
 
 ### Error event reasons
@@ -121,13 +114,14 @@ logical key) and optional `cache` (the cache `name`, omitted for
 | --- | --- | --- | --- |
 | `redis_error` | `'error'` | `keys`, `err` | Redis error under `'protect-source'` that rejects the request. |
 | `redis_error_fallback` | `'warn'` | `keys`, `err` | Redis error handled without rejecting: direct fetch or mutation failure under `'availability'`, or a post-fetch commit error under either strategy. |
-| `fetch_cold_failure` | `'error'` | `err` | `fetch` failed without a usable stale value remaining (excluding a direct fallback fetch aborted because all callers left). |
+| `fetch_cold_failure` | `'error'` | `err` | `fetch` failed without a usable stale value remaining. |
 | `fatal` | `'error'` | `err` | `fetch` threw a fatal error during a stale refresh. |
 | `stale_fallback` | `'warn'` | `stage`, `err` | A stale value was returned after a Redis error (`'redis'`), cache read error (`'read'`), or non-fatal fetch error (`'refresh'`). |
-| `timeout` | `'warn' \| 'error'` | `err`, `durationMs` | `fetchTimeout` expired (`'warn'` when usable stale data remains, `'error'` without stale data), or a cold wait hit the waiting limit (`'error'`). Waiting expiries that return stale data emit no `timeout` event. |
+| `timeout` | `'warn' \| 'error'` | `err`, `durationMs` | `fetchTimeout` expired (`'warn'` when usable stale data remains), or a cold wait hit the waiting limit. |
 | `lock_lost` | `'warn'` | `durationMs` | Lock renewal found the lock gone, or `fetch` finished after its lock expired or was cleared; write skipped. |
-| `lock_renewal_failure` | `'warn'` | `err` | Background lock renewal failed while `fetch` ran (retried until `fetch` settles or `fetchTimeout` fires). |
+| `lock_renewal_failure` | `'warn'` | `err` | Background lock renewal failed while `fetch` ran. |
 | `lock_release_failure` | `'warn'` | `err` | Releasing the lock or writing the cooldown marker failed. |
+| `unreadable_entry` | `'warn'` | | A cached entry used an unknown format and was treated as a miss. |
 
-On Redis error events, `keys` lists every affected key (including secondary keys
-of a failed `SwrWriteBatch`) and `key` is `keys[0]`.
+On Redis error events, `keys` lists every affected key, including secondary keys
+of a failed `SwrWriteBatch`.

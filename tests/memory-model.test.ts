@@ -452,7 +452,7 @@ async function runOnce(
     }
 
     for (const proc of procs) {
-      await proc.internals.flush()
+      await proc.internals.drain()
       if (proc.memory.versionCount !== 0) {
         return describe(`${proc.name} leaked ${proc.memory.versionCount} key versions`)
       }

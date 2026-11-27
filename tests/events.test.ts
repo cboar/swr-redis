@@ -126,7 +126,7 @@ test('Events: error reasons and severities', { timeout: 5000 }, async (t) => {
         await cache.set(undefined, 'stale')
         redis.advanceTime(1500)
         assert.equal(await cache.get(), 'stale')
-        await swr.flush()
+        await swr.drain()
       }),
       [expected],
     )
@@ -163,7 +163,7 @@ test('Events: error reasons and severities', { timeout: 5000 }, async (t) => {
         await entered.promise
         await tick(t, redis, 1000)
         await result
-        await swr.flush()
+        await swr.drain()
       }),
       [expected],
     )

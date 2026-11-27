@@ -65,7 +65,7 @@ export class LruMemory implements MemoryStore {
     const { freshUntilMs, cachedAtMs } = entry.timing
     if (now >= freshUntilMs || now - cachedAtMs >= this.maxTtlMs) return undefined
 
-    this.entries.set(key, entry) // most recently used
+    this.entries.set(key, entry)
     return (
       this.clones ? { value: structuredClone(entry.value), timing: entry.timing } : entry
     ) as Envelope<T>

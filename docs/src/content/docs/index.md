@@ -41,13 +41,14 @@ const swr = createSwrClient({
   redis,
   prefix: 'my-app:prod',
   ttl: 120,
-  staleMultiplier: 5,
+  stale: 480,
 })
 ```
 
 `prefix` namespaces every key the client writes; use a distinct prefix per
 application and environment sharing a Redis server. Entries stay fresh for `ttl`
-seconds and are served stale until `ttl * staleMultiplier` seconds.
+seconds and can be served stale for `stale` seconds after that (default
+`({ ttl }) => ttl * 4`).
 
 The client does not open or close `redis`. Close the connection when your
 application shuts down.
@@ -110,12 +111,14 @@ fill the cache.
 Use `getWithMeta()` when you need per-call metadata alongside the value. It
 returns `value`, `source`, and an optional `timing` object.
 
-`source` tells you whether the value came from the in-memory cache, Redis, or
-this call's own fetch. This includes stale values served from Redis.
+`source` is `'memory'`, `'redis'` (including stale values), `'fetch'` (this
+call's own fetch under the lock), or `'direct'` (an uncached fallback fetch
+after a Redis failure).
 
 `timing` carries the `cachedAtMs`, `freshUntilMs`, and `expiresAtMs` timestamps
-recorded by the writer. Fetch results omit `timing` if the call skips the cache
-write or the write fails to commit.
+recorded by the writer. It is omitted for `'direct'` results and for `'fetch'`
+results that do not commit to Redis (`SwrNoCache`, lost locks, or failed
+commits).
 
 ```ts
 const { value, source, timing } = await userCache.getWithMeta('u_123')
@@ -139,11 +142,11 @@ await db.updateUser('u_123', { name: 'Ada' })
 await userCache.invalidate('u_123')
 ```
 
-To remove multiple keys in one call, pass them to `swr.invalidateKeys` using
-`cache.key`:
+To remove multiple keys in one call, pass an array of keys to
+`swr.invalidateKeys` using `cache.key`:
 
 ```ts
-await swr.invalidateKeys(userCache.key('u_123'), userCache.key('u_456'))
+await swr.invalidateKeys([userCache.key('u_123'), userCache.key('u_456')])
 ```
 
 ## Before you deploy
@@ -157,7 +160,7 @@ await swr.invalidateKeys(userCache.key('u_123'), userCache.key('u_456'))
   [write ordering](/swr-redis/consistency/#write-ordering).
 - **Configure serverless runtimes and shutdown.** In serverless runtimes, set
   `runtime: 'serverless'` or pass `waitUntil` so refreshes aren't frozen after
-  the response. On long-lived servers, call `await swr.flush()` before closing
+  the response. On long-lived servers, call `await swr.drain()` before closing
   Redis. See
   [background refresh lifecycle](/swr-redis/consistency/#background-refresh-lifecycle).
 - **Memory caching is per process.** When `memory` is enabled, invalidations in

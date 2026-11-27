@@ -19,14 +19,14 @@ Durations are in seconds.
 | `key` | Cache | Required. Static string, or `(context) => string`. |
 | `fetch` | Cache | Required. `(context, meta) => Promise<value>`. See [fetch results](/swr-redis/fetch-results/). |
 | `ttl` | Client, cache | Fresh lifetime in seconds. A cache can pass a callback. Default: `120`. |
-| `staleMultiplier` | Client, cache | Total Redis lifetime is `ttl * staleMultiplier`. Set `1` to disable the stale window. Default: `5`. |
+| `stale` | Client, cache | Seconds an entry stays usable as stale after `ttl` (`0` disables the stale window), or a callback. Total Redis lifetime is `ttl + stale`. Default: `({ ttl }) => ttl * 4`. |
 | `staleWait` | Client, cache, `get()` | Seconds a caller holding stale data waits for fresh data (`0` returns stale immediately, `Infinity` waits until settled). Default: `0`. |
 | `runtime` | Client | What happens without a `waitUntil` hook: `'server'` (background work allowed) or `'serverless'` (lock winner waits inline). Default: `'server'`. |
-| `fetchTimeout` | Client, cache | Seconds a single `fetch` call may run; also bounds how long waiters poll. Default: `30`. |
+| `fetchTimeout` | Client, cache | Seconds a single `fetch` call may run; also bounds how long waiters wait. Default: `30`. |
 | `failureCooldown` | Client, cache | Seconds a key rests after a fetch fails or times out (`0` disables). Default: `1`. |
 | `failureStrategy` | Client, cache | Behavior on Redis errors when no stale value is available: `'availability'` or `'protect-source'`. Default: `'availability'`. |
 | `memory` | Client, cache, `get()` | Process-local LRU cache. Enable on the client with `true` or `{ maxEntries, maxTtl, clone }`; pass `false` on a cache or `get()` to opt out. Default: `false`. |
-| `signal` | `get()` | Cancels this call (checked between steps) without aborting a leased refresh (a direct fallback fetch under `'availability'` aborts once its last caller leaves). Pass `AbortSignal.timeout(ms)` for a request deadline. |
+| `signal` | `get()` | Cancels this call (checked between steps) without aborting a shared refresh (a direct fallback fetch under `'availability'` aborts once its last caller leaves). Pass `AbortSignal.timeout(ms)` for a request deadline. |
 | `name` | Cache | Low-cardinality label reported as `event.cache`. |
 | `codec` | Client, cache | Serializer: `{ encode, decode }`. Default: BSON. |
 | `compression` | Client, cache | zlib settings: `true`, `false`, or `{ level, minBytes }`. Default: `{ level: 1, minBytes: 256 }`. |
@@ -38,8 +38,9 @@ Durations are in seconds.
 
 ## Set the TTL from the fetched value
 
-A cache's `ttl` can be a synchronous callback receiving `{ context, key, value }`,
-for example to cache misses for a shorter time:
+`ttl` (on a cache) and `stale` (on a client or cache) can be synchronous
+callbacks. `ttl` receives `{ context, key, value }`; `stale` also receives the
+resolved `ttl`:
 
 ```ts
 const userById = swr.cache({
@@ -47,16 +48,14 @@ const userById = swr.cache({
   key: (id: string) => `user:${id}`,
   fetch: (id) => db.getUser(id), // Promise<User | null>
   ttl: ({ value }) => (value === null ? 5 : 120),
-  staleMultiplier: 5, // null: 5s fresh, 25s total. User: 120s fresh, 600s total.
+  stale: ({ value, ttl }) => (value === null ? 0 : ttl * 4), // null: 5s fresh, no stale. User: 120s fresh, 480s stale.
 })
 ```
 
-Place `fetch` before `ttl` so TypeScript infers `value` (or annotate `fetch` /
-pass explicit type arguments `swr.cache<User | null, string>()`).
+Place `fetch` before `ttl` and `stale` so TypeScript infers `value` (or annotate
+`fetch` / pass explicit type arguments `swr.cache<User | null, string>()`).
 
-The callback runs when preparing a cache write from `fetch` or `set()`.
-Return a positive finite number in seconds. Other clients reading the same
-key use the lifetime chosen by the writer.
+Other clients reading the same key use the lifetime chosen by the writer.
 
 ## Cache values in memory
 
@@ -99,7 +98,7 @@ const userFromRedis = await userCache.get('u_123', { memory: false })
 ### Timing, cooldowns, and polling
 
 `fetchTimeout` bounds each source call (including background refreshes) and also
-caps how long waiters poll behind it. Set it above how long your source normally
+caps how long waiters wait behind it. Set it above how long your source normally
 takes, because late results are discarded and trigger a cooldown.
 
 `failureCooldown` spaces out retries after a fetch fails or times out (about one
@@ -149,9 +148,11 @@ to tune it (`level` `0`–`9`).
 
 Compression settings can be changed safely without invalidating existing keys.
 Changing a `codec` cannot decode old entries, so bump a version segment in your
-key. Decode and decompression errors throw under both failure strategies without
-triggering a new fetch, unless a caller holding an unexpired stale value can
-fall back to it (reported via a `stale_fallback` event).
+key. Decode and decompression errors on a known format throw under both failure
+strategies without triggering a new fetch, unless a caller holding an unexpired
+stale value can fall back to it (reported via a `stale_fallback` event). Entries
+written in an unknown or unsupported format are treated as misses instead and
+emit an `unreadable_entry` warning.
 
 ### Set ioredis command timeouts
 
@@ -175,5 +176,5 @@ const largePayloadSwr = createSwrClient({
 })
 ```
 
-Each client keeps its own memory cache and `flush()` tracks only that client's
+Each client keeps its own memory cache and `drain()` tracks only that client's
 background refreshes. Close both connections on shutdown.

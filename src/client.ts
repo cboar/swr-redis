@@ -39,14 +39,14 @@ export function createSwrClient(options: SwrClientOptions): SwrClient {
       }
     },
 
-    async invalidateKeys(...keys: string[]) {
+    async invalidateKeys(keys) {
       const [first, ...rest] = keys
       if (first === undefined) return
       for (const key of keys) requireNonEmpty(key, 'key')
       await internals.invalidate([first, ...rest], resolved.failureStrategy)
     },
 
-    flush: () => internals.flush(),
+    drain: () => internals.drain(),
   }
 }
 
@@ -61,7 +61,7 @@ interface ClientInternalsInit {
 
 export interface ClientInternals extends ClientInternalsInit {
   track(promise: Promise<unknown>, waitUntil?: (promise: Promise<unknown>) => void): void
-  flush(): Promise<void>
+  drain(): Promise<void>
   invalidate(keys: SwrNonEmptyKeys, strategy: SwrFailureStrategy, emit?: Emit): Promise<void>
 }
 
@@ -79,7 +79,7 @@ export function createClientInternals(init: ClientInternalsInit): ClientInternal
       waitUntil?.(promise)
     },
 
-    async flush() {
+    async drain() {
       while (inflight.size > 0) {
         await Promise.allSettled([...inflight])
       }

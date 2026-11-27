@@ -1,5 +1,11 @@
 import type { ClientInternals } from './client.ts'
-import { decodeEnvelopeValue, encodeEnvelope, readEnvelopeHeader, type Envelope } from './codec.ts'
+import {
+  decodeEnvelopeValue,
+  encodeEnvelope,
+  readEnvelopeHeader,
+  type Envelope,
+  type EnvelopeHeader,
+} from './codec.ts'
 import { DirectFetches } from './direct.ts'
 import { isFatalError, SwrTimeoutError, SwrValidationError } from './errors.ts'
 import {
@@ -13,7 +19,8 @@ import { requireNonEmpty } from './keys.ts'
 import { isCooldownMarker, RedisLock, type AcquireOutcome, type RedisWriteEntry } from './lock.ts'
 import type { MemoryWrite, ReadGuard } from './memory.ts'
 import {
-  requireTtl,
+  requireNonNegative,
+  requirePositive,
   resolveCacheOptions,
   resolveStaleWaitMs,
   toRedisTtlMs,
@@ -24,6 +31,7 @@ import type {
   SwrNonEmptyKeys,
   SwrCache,
   SwrCacheOptions,
+  SwrCacheWrite,
   SwrCodec,
   SwrEntryTiming,
   SwrEvent,
@@ -55,6 +63,18 @@ type LockAttempt =
 
 type PreparedWrite = RedisWriteEntry & MemoryWrite & { readonly timing: SwrEntryTiming }
 
+interface Lifetime {
+  readonly ttl: number
+  readonly stale: number
+}
+
+interface ResolvedWrite<V> {
+  readonly key: string
+  readonly value: V
+  readonly lifetime: Lifetime
+  readonly encoder: Pick<SwrCodec<V>, 'encode'>
+}
+
 type PreparedCommit<T> =
   | { kind: 'no-cache'; value: T }
   | {
@@ -73,18 +93,13 @@ type WaitResult<T> =
   | { outcome: 'resolved' | 'stale_fallback'; envelope: Envelope<T> }
   | { outcome: 'timeout'; elapsedMs: number; stale?: Envelope<T> }
   | { outcome: 'error'; err: unknown }
-  | { outcome: 'lock_stolen'; lock: RedisLock }
+  | { outcome: 'lock_takeover'; lock: RedisLock }
 
 // Result of a tracked refresh; never rejects and has already reported any failure.
 type RefreshOutcome<T> =
   { kind: 'ok'; result: SwrGetResult<T> } | { kind: 'failed'; err: unknown; fallback?: Envelope<T> }
 
-interface PollProgress {
-  attempts: number
-  readonly startedAt: number
-}
-
-type PollOutcome = Extract<SwrEvent, { type: 'poll' }>['outcome']
+type WaitOutcome = Extract<SwrEvent, { type: 'wait' }>['outcome']
 type RefreshTrigger = Extract<SwrEvent, { type: 'refresh' }>['trigger']
 type StaleFallbackStage = Extract<SwrEvent, { reason: 'stale_fallback' }>['stage']
 
@@ -159,7 +174,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         return { redisError: err }
       }
       req.signal?.throwIfAborted()
-      return { entry: this.decodeAndPopulate(buf, 'usable', guard) }
+      return { entry: this.decodeAndPopulate(req, buf, 'usable', guard) }
     })
     if ('redisError' in read) return this.onRedisError(req, read.redisError)
 
@@ -173,18 +188,16 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   async set(context: Context, value: T) {
     const { redis, keys, memory } = this.client
     const key = this.options.keyOf(context)
-    const ttl = this.resolvePrimaryTtl(context, key, value)
-    const { envelope, buffer, ttlMs } = this.prepareWrite(
-      value,
+    const lifetime = this.resolveLifetime(context, key, value)
+    const write = this.prepareWrite(
+      { key, value, lifetime, encoder: this.options.codec },
       Date.now(),
-      ttl,
-      this.options.codec,
       this.options.memoryEnabled,
     )
 
-    const pending = memory.beginWrite([{ key, envelope }])
+    const pending = memory.beginWrite([write])
     try {
-      await redis.swrSetAndClearLock(keys.data(key), keys.lock(key), buffer, ttlMs)
+      await redis.swrSetAndClearLock(write.dataKey, keys.lock(key), write.buffer, write.ttlMs)
     } catch (err) {
       memory.settle(pending, 'evict')
       const redisError = this.reportRedisError(key, err)
@@ -215,8 +228,20 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     }
   }
 
-  private decodeAndPopulate(buf: Buffer | null, accept: Accept, guard: ReadGuard | undefined) {
-    const entry = decodeEntry(buf, accept, this.options.codec)
+  private decodeAndPopulate(
+    req: CacheRequest<Context>,
+    buf: Buffer | null,
+    accept: Accept,
+    guard: ReadGuard | undefined,
+  ) {
+    if (!buf) return undefined
+    const header = readEnvelopeHeader(buf)
+    // An unknown format is expected during a deploy, so it reads as a miss rather than an error.
+    if (!header) {
+      this.emit?.(errorEvent('unreadable_entry', req.key, {}))
+      return undefined
+    }
+    const entry = decodeEntry(buf, header, accept, this.options.codec)
     if (entry?.fresh) this.client.memory.populate(guard, entry.envelope, entry.now)
     return entry
   }
@@ -261,10 +286,10 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
           ? this.serveStaleAfterError(key, stale, 'redis', attempt.err)
           : this.onRedisError(req, attempt.err)
       case 'cooldown':
-        return usable ? cached(stale, 'redis') : this.poll(req)
+        return usable ? cached(stale, 'redis') : this.wait(req)
       case 'busy':
-        if (!usable) return this.poll(req)
-        return req.staleWaitMs === 0 ? cached(stale, 'redis') : this.poll(req, stale)
+        if (!usable) return this.wait(req)
+        return req.staleWaitMs === 0 ? cached(stale, 'redis') : this.wait(req, stale)
       case 'acquired':
         // An expired snapshot refreshes as a cold miss.
         const snapshot = usable ? stale : undefined
@@ -278,32 +303,32 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
     if (attempt.status !== 'acquired') {
       this.emit?.({ type: 'miss', key: req.key, action: 'wait' })
-      return this.poll(req)
+      return this.wait(req)
     }
 
     this.emit?.({ type: 'miss', key: req.key, action: 'fetch' })
     return this.refreshAsOwner(req, attempt.lock, 'cold_miss')
   }
 
-  private async poll(req: CacheRequest<Context>, stale?: Envelope<T>): Promise<SwrGetResult<T>> {
-    const progress: PollProgress = { attempts: 0, startedAt: Date.now() }
+  private async wait(req: CacheRequest<Context>, stale?: Envelope<T>): Promise<SwrGetResult<T>> {
+    const startedAt = Date.now()
     let result: WaitResult<T>
     try {
-      result = await this.waitForEntry(req, stale, progress)
+      result = await this.waitForEntry(req, stale, startedAt)
     } catch (err) {
       if (req.signal?.aborted) {
-        this.emitPoll(req, 'cancelled', progress)
+        this.emitWait(req, 'cancelled', startedAt)
         throw req.signal.reason
       }
-      this.emitPoll(req, 'error', progress)
+      this.emitWait(req, 'error', startedAt)
       // waitForEntry only throws non-abort errors from decodeAndPopulate.
       if (isUsable(stale)) return this.serveStaleAfterError(req.key, stale, 'read', err)
       throw err
     }
-    this.emitPoll(
+    this.emitWait(
       req,
       result.outcome,
-      progress,
+      startedAt,
       result.outcome === 'timeout' ? result.elapsedMs : undefined,
     )
 
@@ -322,15 +347,15 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         return isUsable(stale)
           ? this.serveStaleAfterError(req.key, stale, 'redis', result.err)
           : this.onRedisError(req, result.err)
-      case 'lock_stolen':
-        return this.refreshAsOwner(req, result.lock, 'lock_stolen')
+      case 'lock_takeover':
+        return this.refreshAsOwner(req, result.lock, 'lock_takeover')
     }
   }
 
   private async waitForEntry(
     req: CacheRequest<Context>,
     stale: Envelope<T> | undefined,
-    progress: PollProgress,
+    startedAt: number,
   ): Promise<WaitResult<T>> {
     const { fetchTimeoutMs, pollIntervalMs } = this.options
     const { signal } = req
@@ -339,12 +364,11 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       // fetchTimeout is the waiting limit and caps staleWait. An expired snapshot waits as cold.
       const usable = isUsable(stale) ? stale : undefined
       const limitMs = usable ? Math.min(req.staleWaitMs, fetchTimeoutMs) : fetchTimeoutMs
-      const elapsedMs = Date.now() - progress.startedAt
+      const elapsedMs = Date.now() - startedAt
       if (elapsedMs >= limitMs) return { outcome: 'timeout', elapsedMs, stale: usable }
 
       await sleep(pollDelayMs(pollIntervalMs, limitMs, elapsedMs), signal)
 
-      progress.attempts++
       const accept: Accept = isUsable(stale) ? 'fresh' : 'usable'
       const snapshot = await this.pollSnapshot(req, accept)
       if (snapshot.status === 'redis_error') return { outcome: 'error', err: snapshot.err }
@@ -357,7 +381,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
 
       const attempt = await this.tryLock(req)
       if (attempt.status === 'redis_error') return { outcome: 'error', err: attempt.err }
-      if (attempt.status === 'acquired') return { outcome: 'lock_stolen', lock: attempt.lock }
+      if (attempt.status === 'acquired') return { outcome: 'lock_takeover', lock: attempt.lock }
     }
   }
 
@@ -373,25 +397,24 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
       }
       req.signal?.throwIfAborted()
 
-      const entry = this.decodeAndPopulate(data ?? null, accept, guard)
+      const entry = this.decodeAndPopulate(req, data ?? null, accept, guard)
       if (entry) return { status: 'hit', envelope: entry.envelope }
       if (!lock) return { status: 'unlocked' }
       return { status: isCooldownMarker(lock) ? 'cooldown' : 'locked' }
     })
   }
 
-  private emitPoll(
+  private emitWait(
     req: CacheRequest<Context>,
-    outcome: PollOutcome,
-    progress: PollProgress,
+    outcome: WaitOutcome,
+    startedAt: number,
     durationMs?: number,
   ) {
     this.emit?.({
-      type: 'poll',
+      type: 'wait',
       outcome,
       key: req.key,
-      attempts: progress.attempts,
-      durationMs: durationMs ?? Date.now() - progress.startedAt,
+      durationMs: durationMs ?? Date.now() - startedAt,
     })
   }
 
@@ -521,7 +544,7 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
         this.fetchUncached(req, signal),
       ),
     )
-    if (outcome.status === 'resolved') return fetched(outcome.value)
+    if (outcome.status === 'resolved') return { value: outcome.value, source: 'direct' as const }
     throw outcome.err // reported once per fetch through DirectFetches' onFailed
   }
 
@@ -560,31 +583,21 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
     if (result instanceof SwrNoCache) return { kind: 'no-cache', value: result.value }
 
     const isBatch = result instanceof SwrWriteBatch
+    const batch = isBatch ? result : undefined
     const value = isBatch ? result.primary : result
-    if (isBatch) validateBatch(result, req.key)
-    const primaryTtl =
-      (isBatch ? result.ttl : undefined) ?? this.resolvePrimaryTtl(req.context, req.key, value)
+    if (batch) validateBatch(batch, req.key)
+    const lifetime = this.resolveLifetime(req.context, req.key, value, batch)
 
     const cachedAtMs = Date.now()
-    const { useMemory } = req
+    const prepare = <V>(write: ResolvedWrite<V>) =>
+      this.prepareWrite(write, cachedAtMs, req.useMemory)
+    const { codec: clientCodec } = this.client.options
     const entries: [PreparedWrite, ...PreparedWrite[]] = [
-      {
-        key: req.key,
-        dataKey: req.dataKey,
-        ...this.prepareWrite(value, cachedAtMs, primaryTtl, this.options.codec, useMemory),
-      },
+      prepare({ key: req.key, value, lifetime, encoder: this.options.codec }),
+      ...(batch?.secondary ?? []).map((write) =>
+        prepare(resolveSecondary(write, lifetime, clientCodec)),
+      ),
     ]
-    if (isBatch) {
-      for (const { key, value: secondaryValue, ttl, codec } of result.secondary) {
-        const encoder =
-          (codec as Pick<SwrCodec<unknown>, 'encode'> | undefined) ?? this.client.options.codec
-        entries.push({
-          key,
-          dataKey: this.client.keys.data(key),
-          ...this.prepareWrite(secondaryValue, cachedAtMs, ttl ?? primaryTtl, encoder, useMemory),
-        })
-      }
-    }
 
     return { kind: 'write', value, entries, durationMs: Date.now() - startedAt }
   }
@@ -633,31 +646,47 @@ export class SwrCacheImpl<T = unknown, Context = void> implements SwrCache<T, Co
   }
 
   private prepareWrite<V>(
-    value: V,
+    write: ResolvedWrite<V>,
     cachedAtMs: number,
-    ttl: number,
-    encoder: Pick<SwrCodec<V>, 'encode'>,
     useMemory: boolean,
-  ) {
-    const { staleMultiplier, compression } = this.options
-    const ttlMs = toRedisTtlMs(ttl, staleMultiplier)
+  ): PreparedWrite {
+    const { key, value, lifetime, encoder } = write
+    const { ttl, stale } = lifetime
+    const ttlMs = toRedisTtlMs(ttl + stale)
     // Freeze once so callers cannot mutate shared deadlines.
     const timing: SwrEntryTiming = Object.freeze({
       cachedAtMs,
       freshUntilMs: cachedAtMs + ttl * 1000,
-      expiresAtMs: cachedAtMs + ttl * staleMultiplier * 1000,
+      expiresAtMs: cachedAtMs + (ttl + stale) * 1000,
     })
-    const buffer = encodeEnvelope(value, timing, encoder, compression)
-    if (!useMemory) return { timing, buffer, ttlMs }
+    const dataKey = this.client.keys.data(key)
+    const buffer = encodeEnvelope(value, timing, encoder, this.options.compression)
+    if (!useMemory) return { key, dataKey, timing, buffer, ttlMs }
     // Clone before writing to Redis so uncloneable values fail before any Redis write.
     const memoryValue = this.client.memory.clones ? structuredClone(value) : value
-    return { timing, buffer, ttlMs, envelope: { value: memoryValue, timing } }
+    return { key, dataKey, timing, buffer, ttlMs, envelope: { value: memoryValue, timing } }
   }
 
-  private resolvePrimaryTtl(context: Context, key: string, value: T) {
+  private resolveLifetime(
+    context: Context,
+    key: string,
+    value: T,
+    override?: { readonly ttl?: number; readonly stale?: number },
+  ): Lifetime {
+    const ttl = override?.ttl ?? this.resolveTtl(context, key, value)
+    return { ttl, stale: override?.stale ?? this.resolveStale(context, key, value, ttl) }
+  }
+
+  private resolveTtl(context: Context, key: string, value: T) {
     const { ttl } = this.options
     if (typeof ttl === 'number') return ttl
-    return requireTtl(ttl({ context, key, value }), 'ttl callback result')
+    return requirePositive(ttl({ context, key, value }), 'ttl callback result')
+  }
+
+  private resolveStale(context: Context, key: string, value: T, ttl: number) {
+    const { stale } = this.options
+    if (typeof stale === 'number') return stale
+    return requireNonNegative(stale({ context, key, value, ttl }), 'stale callback result')
   }
 }
 
@@ -679,9 +708,7 @@ function fetched<T>(value: T, timing?: SwrEntryTiming): SwrGetResult<T> {
   return timing ? { value, source: 'fetch', timing } : { value, source: 'fetch' }
 }
 
-function decodeEntry<T>(buf: Buffer | null, accept: Accept, codec: SwrCodec<T>) {
-  if (!buf) return undefined
-  const header = readEnvelopeHeader(buf)
+function decodeEntry<T>(buf: Buffer, header: EnvelopeHeader, accept: Accept, codec: SwrCodec<T>) {
   const { timing } = header
   const now = Date.now()
   const deadlineMs = accept === 'fresh' ? timing.freshUntilMs : timing.expiresAtMs
@@ -691,13 +718,28 @@ function decodeEntry<T>(buf: Buffer | null, accept: Accept, codec: SwrCodec<T>) 
   return { envelope: { value, timing }, fresh: now < timing.freshUntilMs, now }
 }
 
+function resolveSecondary(
+  write: SwrCacheWrite,
+  primary: Lifetime,
+  clientCodec: SwrCodec<unknown>,
+): ResolvedWrite<unknown> {
+  return {
+    key: write.key,
+    value: write.value,
+    lifetime: { ttl: write.ttl ?? primary.ttl, stale: write.stale ?? primary.stale },
+    encoder: (write.codec as Pick<SwrCodec<unknown>, 'encode'> | undefined) ?? clientCodec,
+  }
+}
+
 function validateBatch(batch: SwrWriteBatch<unknown>, primaryKey: string) {
-  if (batch.ttl !== undefined) requireTtl(batch.ttl, 'batch ttl')
+  if (batch.ttl !== undefined) requirePositive(batch.ttl, 'batch ttl')
+  if (batch.stale !== undefined) requireNonNegative(batch.stale, 'batch stale')
   const seenKeys = new Set([primaryKey])
-  for (const { key, ttl } of batch.secondary) {
+  for (const { key, ttl, stale } of batch.secondary) {
     requireNonEmpty(key, 'key')
     if (seenKeys.has(key)) throw new SwrValidationError(`Duplicate cache write key: "${key}"`)
     seenKeys.add(key)
-    if (ttl !== undefined) requireTtl(ttl, 'secondary ttl')
+    if (ttl !== undefined) requirePositive(ttl, 'secondary ttl')
+    if (stale !== undefined) requireNonNegative(stale, 'secondary stale')
   }
 }

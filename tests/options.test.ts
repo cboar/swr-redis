@@ -28,14 +28,22 @@ const INVALID_OPTION_CASES: InvalidOptionCase[] = [
     expectedFragment: 'ttl',
   })),
   {
-    label: 'same-layer oversized ttl * staleMultiplier',
-    options: { ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000) + 1, staleMultiplier: 2 },
+    label: 'same-layer oversized ttl + stale',
+    options: {
+      ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000) + 1,
+      stale: Math.floor(Number.MAX_SAFE_INTEGER / 2000) + 1,
+    },
     expectedFragment: 'ttl',
   },
-  ...([0.5, 0, -1, NaN, Infinity] as const).map((staleMultiplier) => ({
-    label: `staleMultiplier=${String(staleMultiplier)}`,
-    options: { staleMultiplier },
-    expectedFragment: 'staleMultiplier',
+  {
+    label: 'oversized stale',
+    options: { stale: Math.floor(Number.MAX_SAFE_INTEGER / 1000) + 1 },
+    expectedFragment: 'ttl',
+  },
+  ...([-1, NaN, Infinity, -Infinity] as const).map((stale) => ({
+    label: `stale=${String(stale)}`,
+    options: { stale },
+    expectedFragment: 'stale must',
   })),
   ...([0, -1, NaN, Infinity, -Infinity, MAX_TIMER_MS / 1000 + 0.001] as const).map((lockTtl) => ({
     label: `lockTtl=${String(lockTtl)}`,
@@ -110,14 +118,14 @@ test('Options validation: rejects empty prefixes, cache names, and keys', async 
   const dynamic = swr.cache({ key: () => '', fetch: async () => 'v' })
   assert.throws(() => dynamic.key(), rejects('key'))
   await assert.rejects(dynamic.get(), rejects('key'))
-  await assert.rejects(swr.invalidateKeys(''), rejects('key'))
+  await assert.rejects(swr.invalidateKeys(['']), rejects('key'))
 
   // Every key is validated before any eviction.
   const withMemory = createSwrClient({ redis, memory: true })
   const a = withMemory.cache({ key: 'a', fetch: async () => 'fetched' })
   await a.set(undefined, 'kept')
   await redis.unlink(keys.data('a'))
-  await assert.rejects(withMemory.invalidateKeys('a', ''), rejects('key'))
+  await assert.rejects(withMemory.invalidateKeys(['a', '']), rejects('key'))
   assert.equal(await a.get(), 'kept')
 })
 
@@ -127,39 +135,50 @@ test('Options validation: enforces merged cross-layer resolved Redis TTL ceiling
 
   const clientWithHighTtl = createSwrClient({ redis, ttl: halfMaxPlusOne })
   assert.throws(
-    () => clientWithHighTtl.cache({ key: 'cross-ttl-default-mult', fetch: async () => 'v' }),
-    SwrValidationError,
-  )
-  assert.throws(
     () =>
       clientWithHighTtl.cache({
-        key: 'cross-ttl-mult-2',
-        staleMultiplier: 2,
+        key: 'cross-ttl-high-stale',
+        stale: halfMaxPlusOne,
         fetch: async () => 'v',
       }),
     SwrValidationError,
   )
   clientWithHighTtl.cache({
-    key: 'cross-ttl-mult-1',
-    staleMultiplier: 1,
+    key: 'cross-ttl-no-stale',
+    stale: 0,
     fetch: async () => 'v',
   })
 
-  const clientWithMult2 = createSwrClient({ redis, staleMultiplier: 2 })
+  const clientWithHighStale = createSwrClient({
+    redis,
+    stale: Math.floor(Number.MAX_SAFE_INTEGER / 2000),
+  })
   assert.throws(
     () =>
-      clientWithMult2.cache({
+      clientWithHighStale.cache({
         key: 'cross-mult-high-ttl',
         ttl: halfMaxPlusOne,
         fetch: async () => 'v',
       }),
     SwrValidationError,
   )
-  clientWithMult2.cache({
+  clientWithHighStale.cache({
     key: 'cross-mult-max-ttl',
     ttl: Math.floor(Number.MAX_SAFE_INTEGER / 2000),
     fetch: async () => 'v',
   })
+
+  // A callback ttl is always positive, so an oversized stale alone fails every write.
+  assert.throws(
+    () =>
+      createSwrClient({ redis }).cache({
+        key: 'callback-ttl-oversized-stale',
+        ttl: () => 1,
+        stale: Math.floor(Number.MAX_SAFE_INTEGER / 1000) + 1,
+        fetch: async () => 'v',
+      }),
+    SwrValidationError,
+  )
 })
 
 test('Options: omitting memory or setting it to false uses Redis on each read', async (t) => {
@@ -210,7 +229,7 @@ test('Options validation: accepts valid boundary values on client and cache over
   const boundaryOptions: SwrSharedOptions[] = [
     {
       ttl: 0.1,
-      staleMultiplier: 1,
+      stale: 0,
       lockTtl: 0.05,
       fetchTimeout: 0.05,
       staleWait: 0,
@@ -220,12 +239,12 @@ test('Options validation: accepts valid boundary values on client and cache over
     },
     {
       ttl: 1,
-      staleMultiplier: 2,
+      stale: 1,
       compression: true,
     },
     {
       ttl: Math.floor(Number.MAX_SAFE_INTEGER / 1000),
-      staleMultiplier: 1,
+      stale: 0,
     },
     {
       compression: { level: 0, minBytes: 0 },
@@ -261,10 +280,10 @@ test('Options validation: accepts valid boundary values on client and cache over
   })
 })
 
-test('Options inheritance: numeric client TTL and per-cache dynamic override set independent deadlines', async (t) => {
+test('Options inheritance: client ttl and stale, per-cache overrides, and the default stale window set independent deadlines', async (t) => {
   const redis = createFakeRedis(1000)
   useRedisClock(t, redis)
-  const swr = createSwrClient({ redis, ttl: 0.2, staleMultiplier: 1 })
+  const swr = createSwrClient({ redis, ttl: 0.2, stale: 0 })
   const inherited = swr.cache({ key: 'inherited', fetch: async () => null })
   let calls = 0
   const overridden = swr.cache({
@@ -274,19 +293,28 @@ test('Options inheritance: numeric client TTL and per-cache dynamic override set
       assert.equal(value, null)
       return 1
     },
+    stale: 3,
+    fetch: async () => null,
+  })
+  // The default stale window is 4 * ttl, so an entry stays usable for 5 * ttl.
+  const defaulted = createSwrClient({ redis, ttl: 2 }).cache({
+    key: 'defaulted',
     fetch: async () => null,
   })
   await inherited.get()
   await overridden.get()
+  await defaulted.get()
   assert.equal(calls, 1)
   const keys = createRedisKeys(DEFAULTS.prefix)
-  for (const [key, freshUntilMs] of [
-    ['inherited', 1200],
-    ['overridden', 2000],
+  for (const [key, freshUntilMs, expiresAtMs] of [
+    ['inherited', 1200, 1200],
+    ['overridden', 2000, 5000],
+    ['defaulted', 3000, 11_000],
   ] as const) {
     const stored = decodeEnvelope((await redis.getBuffer(keys.data(key)))!)!
-    assert.equal(stored.freshUntilMs, freshUntilMs)
-    assert.equal(stored.expiresAtMs, freshUntilMs)
+    assert.equal(stored.freshUntilMs, freshUntilMs, key)
+    assert.equal(stored.expiresAtMs, expiresAtMs, key)
+    assert.equal(await redis.pttl(keys.data(key)), expiresAtMs - 1000, key)
   }
 })
 

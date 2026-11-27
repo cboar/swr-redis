@@ -23,7 +23,7 @@ const errorEvents = (events: SwrEvent[]) =>
   events.flatMap((e) => (e.type === 'error' ? [`${e.reason}:${e.severity}`] : []))
 
 test(
-  'Defaults (staleWait 0): the winner returns stale at once; its refresh ignores the caller signal and is tracked by waitUntil and flush',
+  'Defaults (staleWait 0): the winner returns stale at once; its refresh ignores the caller signal and is tracked by waitUntil and drain',
   { timeout: 5000 },
   async (t) => {
     const redis = createFakeRedis(1000)
@@ -69,7 +69,7 @@ test(
     assert.equal(fetchCount, 2)
 
     bgGate.resolve()
-    await swr.flush()
+    await swr.drain()
     assert.equal(await cache.get(), 'v-2')
     assert.equal(fetchCount, 2)
   },
@@ -105,13 +105,13 @@ test(
     assert.ok(await redis.get(lockKey('bg-failure')), 'lock is held while the refresh runs')
 
     gate.resolve()
-    await swr.flush()
+    await swr.drain()
     assert.equal(await redis.get(lockKey('bg-failure')), COOLDOWN_MARKER)
     assert.deepEqual(await redis.getBuffer(dataKey('bg-failure')), stored)
     assert.deepEqual(errorEvents(events), ['stale_fallback:warn'])
 
     assert.equal(await cache.get(), 'v-1')
-    await swr.flush()
+    await swr.drain()
     assert.equal(calls, 2)
   },
 )
@@ -190,7 +190,7 @@ const STALE_WAIT_CASES: {
     source: 'redis',
   },
   {
-    name: 'a commit reply slower than staleWait returns stale while flush and the hook wait for the write',
+    name: 'a commit reply slower than staleWait returns stale while drain and the hook wait for the write',
     runtime: 'server',
     staleWait: 0.5,
     hook: true,
@@ -252,24 +252,24 @@ for (const { name, runtime, staleWait, hook, slow, source } of STALE_WAIT_CASES)
       await (slow === 'commit' ? commit.entered : entered.promise)
       await tick(t, redis, 500)
       assert.equal(settled, source === 'redis')
-      let flushed = false
-      const flushing = swr.flush().then(() => (flushed = true))
+      let drained = false
+      const draining = swr.drain().then(() => (drained = true))
       assert.equal(tracked.length, hook ? 1 : 0)
       let hookSettled = false
       const hookDone = hook ? tracked[0]!.then(() => (hookSettled = true)) : undefined
       await setImmediate()
-      assert.equal(flushed, false, 'flush waits for the refresh')
+      assert.equal(drained, false, 'drain waits for the refresh')
       assert.equal(hookSettled, false, 'the hook promise waits for the refresh')
       if (slow === 'commit') commit.release()
       else release.resolve()
-      await flushing
+      await draining
       await hookDone
     }
     const result = await pending
     assert.equal(result.source, source)
     assert.equal(result.value, source === 'redis' ? 'stale' : 'fresh')
 
-    await swr.flush()
+    await swr.drain()
     assert.equal(calls, 1)
     assert.equal(tracked.length, hook ? 1 : 0)
     assert.equal(await redis.get(lockKey('stale-wait')), null)
@@ -397,7 +397,7 @@ test(
       staleWait: 10,
       pollInterval: 0.001,
       onEvent: (event) => {
-        if (event.type === 'poll') polls.push(event.outcome)
+        if (event.type === 'wait') polls.push(event.outcome)
         if (event.type === 'hit' && event.stale && !event.startedRevalidation) waiting.resolve()
       },
     }).cache({
@@ -485,7 +485,7 @@ for (const { name, staleWait, fetchTimeout } of [
       assert.equal(await pending, 'stale')
       assert.equal(await redis.get(lockKey('stale-timeout')), 'winner')
       assert.deepEqual(events.slice(1), [
-        { type: 'poll', key: 'stale-timeout', outcome: 'timeout', attempts: 4, durationMs: 40 },
+        { type: 'wait', key: 'stale-timeout', outcome: 'timeout', durationMs: 40 },
       ])
     },
   )
@@ -515,7 +515,7 @@ for (const role of ['winner', 'poller'] as const) {
         staleWait: role === 'winner' ? 0.5 : 10,
         pollInterval: 0.01,
         onEvent: (event) => {
-          if (event.type === 'poll') polls.push(event.outcome)
+          if (event.type === 'wait') polls.push(event.outcome)
           if (event.type === 'hit') waiting.resolve()
         },
       }).cache({
@@ -549,7 +549,7 @@ for (const role of ['winner', 'poller'] as const) {
       assert.equal(result.value, 'fresh')
       assert.equal(result.source, 'fetch')
       assert.equal(calls, 1)
-      assert.deepEqual(polls, role === 'winner' ? [] : ['lock_stolen'])
+      assert.deepEqual(polls, role === 'winner' ? [] : ['lock_takeover'])
     },
   )
 }
@@ -574,6 +574,6 @@ test('waitUntil: a per-get hook replaces the client hook for that call', async (
   assert.equal(await cache.get(), 1)
   assert.equal(clientTracked.length, 1)
   assert.equal(getTracked.length, 1)
-  await swr.flush()
+  await swr.drain()
   assert.equal(await cache.get(), 2)
 })
